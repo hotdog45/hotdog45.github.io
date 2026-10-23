@@ -1,0 +1,10 @@
+{
+  "release": "2026-10-23-product-lab-v4",
+  "portfolio_entries": 18,
+  "product_lab_cases": 10,
+  "languages": [
+    "zh",
+    "en"
+  ],
+  "execution": "Static browser scenarios using synthetic data; no server-side API is hosted by GitHub Pages."
+}

@@ -2,24 +2,24 @@ const zh = document.body.dataset.lang === 'zh';
 const label = (a,b) => zh ? a : b;
 const controls = document.querySelector('[data-project-controls]');
 if(controls) {
- const input=document.querySelector('#project-search'), type=document.querySelector('#project-type');
+ const input=document.querySelector('#project-search'), type=document.querySelector('#project-type'),layer=document.querySelector('#project-layer');
  const buttons=[...document.querySelectorAll('[data-sector-filter]')], cards=[...document.querySelectorAll('[data-project-card]')];
  const reset=document.querySelector('#reset-projects');
  let sector='';
  const norm=s=>s.normalize('NFKC').toLocaleLowerCase();
- function read(){const q=new URLSearchParams(location.search);input.value=(q.get('q')||'').slice(0,100);type.value=q.get('type')||'';sector=buttons.some(b=>b.dataset.sectorFilter===q.get('sector'))?q.get('sector'):'';}
+ function read(){const q=new URLSearchParams(location.search);input.value=(q.get('q')||'').slice(0,100);type.value=q.get('type')||'';layer.value=q.get('layer')||'';sector=buttons.some(b=>b.dataset.sectorFilter===q.get('sector'))?q.get('sector'):'';}
  function update(write=true){
   const q=norm(input.value.trim());let count=0;
-  cards.forEach(c=>{const visible=(!sector||c.dataset.sector===sector)&&(!type.value||c.dataset.kind===type.value)&&(!q||norm(c.dataset.search).includes(q));c.hidden=!visible;if(visible)count++;});
+  cards.forEach(c=>{const visible=(!sector||c.dataset.sector===sector)&&(!type.value||c.dataset.kind===type.value)&&(!layer.value||c.dataset.layers.split(' ').includes(layer.value))&&(!q||norm(c.dataset.search).includes(q));c.hidden=!visible;if(visible)count++;});
   buttons.forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.sectorFilter===sector)));
-  document.querySelector('#project-count').textContent=`${count} ${label('项案例与方案',count===1?'entry & concept':'entries & concepts')}`;
-  document.querySelector('#project-empty').hidden=count>0;reset.hidden=!q&&!sector&&!type.value;
-  if(write){const u=new URL(location.href);u.search='';if(q)u.searchParams.set('q',input.value.trim());if(sector)u.searchParams.set('sector',sector);if(type.value)u.searchParams.set('type',type.value);history.replaceState(null,'',u);}
+  document.querySelector('#project-count').textContent=`${count} ${label('个展示条目',count===1?'project & solution':'projects & solutions')}`;
+  document.querySelector('#project-empty').hidden=count>0;reset.hidden=!q&&!sector&&!type.value&&!layer.value;
+  if(write){const u=new URL(location.href);u.search='';if(q)u.searchParams.set('q',input.value.trim());if(sector)u.searchParams.set('sector',sector);if(type.value)u.searchParams.set('type',type.value);if(layer.value)u.searchParams.set('layer',layer.value);history.replaceState(null,'',u);}
  }
  read();update(false);
- input.addEventListener('input',()=>update());type.addEventListener('change',()=>update());
+ input.addEventListener('input',()=>update());type.addEventListener('change',()=>update());layer.addEventListener('change',()=>update());
  buttons.forEach(b=>b.addEventListener('click',()=>{sector=b.dataset.sectorFilter;update();}));
- reset.addEventListener('click',()=>{input.value='';type.value='';sector='';update();input.focus();});
+ reset.addEventListener('click',()=>{input.value='';type.value='';layer.value='';sector='';update();input.focus();});
  window.addEventListener('popstate',()=>{read();update(false);});
 }
 document.querySelectorAll('[data-architecture]').forEach(explorer=>{
