@@ -1,3 +1,4 @@
+import './portfolio-app.js';
 const lang = document.body.dataset.lang;
 const toggle = document.querySelector('.menu-toggle');
 const nav = document.querySelector('#site-nav');
@@ -9,7 +10,7 @@ toggle?.addEventListener('click', () => {
   nav.classList.toggle('is-open', opened);
 });
 nav?.querySelectorAll('a').forEach(a => a.addEventListener('click', closeMenu));
-document.addEventListener('keydown', e => { if(e.key === 'Escape') { closeMenu(); toggle?.focus(); } });
+document.addEventListener('keydown', e => { if(e.key === 'Escape' && toggle?.getAttribute('aria-expanded') === 'true') { closeMenu(); toggle.focus(); } });
 document.querySelector('[data-copy]')?.addEventListener('click', async e => {
   const button = e.currentTarget;
   const status = document.querySelector('.copy-status');
