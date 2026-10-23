@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vue 3 与 TypeScript：把后台页面的隐式状态变成明确约定 — Xiaofeng Qiao</title><meta name="description" content="从订单审核页出发，拆分筛选条件、服务器快照和编辑草稿，处理请求竞态、版本冲突与组件事件，让类型真正帮助协作。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/vue-typescript-state/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/vue-typescript-state/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="Vue 3 与 TypeScript：把后台页面的隐式状态变成明确约定 — Xiaofeng Qiao"><meta property="og:description" content="从订单审核页出发，拆分筛选条件、服务器快照和编辑草稿，处理请求竞态、版本冲突与组件事件，让类型真正帮助协作。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2022 · 技术回顾</span><span>6 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">Vue 3 与 TypeScript：把后台页面的隐式状态变成明确约定</h1><p class="article-deck" itemprop="description">从订单审核页出发，拆分筛选条件、服务器快照和编辑草稿，处理请求竞态、版本冲突与组件事件，让类型真正帮助协作。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="一个审核页为什么会有三份订单状态">一个审核页，为什么会有三份“订单状态”</h2>
+<p>订单列表显示“待审核”，详情抽屉已经被改为“通过”，顶部数量却没有变化。这类问题不一定来自响应式失效，而是同一个词被用来描述三种东西：服务器上已经保存的结果、用户正在修改的草稿，以及由当前筛选条件计算出来的列表。</p>
+<p>后台页面变复杂以后，我会先给这些状态划分所有权，再决定拆几个组件、用不用全局 store。组件数量无法说明一致性；一份对象被更多地方引用，也不代表大家对它有相同的修改权。</p>
+<p>本文以 Vue 3 的 Composition API 和 TypeScript 为讨论基础，按 2022 年的技术阶段回顾后台页面设计。示例是独立构造的审核流程，不对应某个客户系统，也不依赖后来增加的 Vue 3.5 API。</p>
+<h2 id="让状态先表达业务再表达组件">让状态先表达业务，再表达组件</h2>
+<p>可以把页面拆成四层：路由中的查询身份、服务端返回的只读快照、抽屉内可丢弃的草稿，以及提交期间的状态。列表条目被打开时，复制需要编辑的字段；关闭抽屉不应该顺便把列表的原对象改掉。</p>
+<pre><code class="language-ts">type ReviewDraft = {
+  orderId: string
+  expectedVersion: number
+  decision: 'approve' | 'reject'
+  reason: string
+}
+
+type SaveState =
+  | { kind: 'idle' }
+  | { kind: 'saving'; requestId: string }
+  | { kind: 'conflict'; currentVersion: number }
+  | { kind: 'failed'; message: string }
+  | { kind: 'saved'; version: number }
+</code></pre>
+<p>这比 <code>loading</code>、<code>success</code>、<code>hasError</code> 三个布尔值更容易审查：一种状态里有哪些字段，是类型的一部分。渲染时先判断 <code>kind</code>，再访问对应内容；新增分支也更容易被编译器提醒。TypeScript 的<a href="https://www.typescriptlang.org/docs/handbook/2/narrowing.html" rel="noopener noreferrer">联合类型与收窄</a>支持这类建模，但无法替服务端验证传入的数据。</p>
+<p>不需要把每个输入字符都做成复杂状态机。重点是不能同时成立的业务阶段，以及阶段之间需要保留的信息。筛选后的总数适合从当前数据派生，用户尚未提交的理由则需要独立保存。把派生值再复制进 store，往往只增加同步任务。</p>
+<h2 id="请求返回时还要检查它属于哪次选择">请求返回时，还要检查它属于哪次选择</h2>
+<p>用户从订单 A 切到 B，A 的详情后返回，不能覆盖 B。只看 <code>orderId</code> 还不完整：同一订单换租户、权限或数据版本时，查询身份也改变了。</p>
+<p>Vue 的 watcher 提供清理回调。下面用与 watcher 绑定的失效标记保护结果，并尝试中止不再需要的请求：</p>
+<pre><code class="language-ts">watch(queryKey, async (key, _previous, onCleanup) =&gt; {
+  let active = true
+  const controller = new AbortController()
+  onCleanup(() =&gt; {
+    active = false
+    controller.abort()
+  })
+  loadState.value = { kind: 'loading' }
+  try {
+    const snapshot = await loadOrder(key, controller.signal)
+    if (active) loadState.value = { kind: 'ready', snapshot }
+  } catch (error) {
+    if (!active) return
+    loadState.value = { kind: 'failed', message: describe(error) }
+  }
+}, { immediate: true })
+</code></pre>
+<p><code>queryKey</code>、<code>loadState</code>、<code>loadOrder</code> 和 <code>describe</code> 是应用提供的类型化接口；这是组合函数的核心片段，不是完整组件。失效标记解决的是结果归属，中止信号用于减少无用工作。服务端可能已经接收请求，所以不能把浏览器取消解释为业务操作已撤销。<a href="https://vuejs.org/guide/essentials/watchers.html" rel="noopener noreferrer">Vue watcher 文档</a>解释了副作用清理；此处使用回调参数形式，不使用 3.5 才增加的 <code>onWatcherCleanup</code>。</p>
+<p>还要小心 <code>finally</code> 中的 <code>loading = false</code>：旧请求的 finally 也会执行，可能把新请求的加载提示关掉。把加载状态纳入同一份请求所有权检查，比逐个补丁更可靠。</p>
+<h2 id="props事件和接口响应是三种不同的边界">Props、事件和接口响应是三种不同的边界</h2>
+<p>详情组件通过 props 接收快照，通过事件提出保存意图。它不应该偷偷修改父组件的订单对象，也不应该直接把弹窗内的全部表单字段当成 API 请求。</p>
+<pre><code class="language-ts">const emit = defineEmits&lt;{
+  (event: 'submit', draft: ReviewDraft): void
+  (event: 'close'): void
+}&gt;()
+</code></pre>
+<p>事件约束可以帮助调用方发现字段缺失，具体写法见 <a href="https://vuejs.org/guide/typescript/composition-api.html" rel="noopener noreferrer">Vue 与 TypeScript</a>。但给 <code>response.json()</code> 写一个 <code>as Order</code> 只是类型断言，不会检查真实响应。网络边界仍要验证对象形状、枚举、版本号和必要字段，再进入页面状态；错误响应不能因为“类型写对了”而被当成订单。</p>
+<p>权限同样不能放在前端类型里解决。按钮隐藏是交互提示，服务端必须按当前身份和当前订单状态重新检查可操作性。审核人的备注、内部字段和操作凭据也不应该由一个通用对象穿过所有组件。</p>
+<h2 id="保存冲突时保留草稿比自动覆盖更有用">保存冲突时，保留草稿比自动覆盖更有用</h2>
+<p>提交请求携带 <code>expectedVersion</code>。服务端只在版本仍符合时修改，并返回新的快照；冲突时返回明确结果和当前版本。前端保留审核理由，提示重新查看差异，而不是默默覆盖其他人的判断。</p>
+<p>保存成功后的列表刷新也有两种合理策略：更新已确认的那一项，或重新获取当前筛选结果。如果审核后条目不再符合“待审核”筛选，应按产品约定移除、短暂标记，或保留到下一次刷新。最差的状态是局部修改了条目，却继续展示未经重新计算的总数。</p>
+<p>请求超时时，应显示“结果尚未确认”，并允许查询回执。再次提交是否使用原请求号，要由服务端的幂等约定决定。每次点击重新生成业务请求号，会把网络重试变成第二次审核意图。</p>
+<h2 id="用坏顺序检验设计是否站得住">用坏顺序检验设计是否站得住</h2>
+<p>最有价值的回归用例通常不是“点按钮出现成功提示”，而是这些交错顺序：A 请求晚于 B 返回；抽屉关闭后请求成功；保存期间切换租户；服务端提交后响应丢失；其他人先更新版本；用户保留草稿并重新读取。</p>
+<p>纯函数可以验证状态转换和快照合并，组件测试需要验证 props 与事件，浏览器测试再覆盖焦点、输入保留和路由切换。下面的预期结果应在测试之前写清：旧结果被丢弃，当前失败可见，草稿可恢复，重复提交不增加副作用。</p>
+<p>本篇的 TypeScript 和 watcher 片段用于说明设计，没有在 Vue 渲染器或真实后台接口中执行。可复用的部分是状态约定与测试顺序；引入项目时仍需用实际组件和服务端契约补齐集成验证。</p>
+<h2 id="页面复杂度最终体现为修改影响的范围">页面复杂度最终体现为修改影响的范围</h2>
+<p>一个好的后台页面结构，让一次输入、一次请求和一次保存各有清楚的影响范围。路由描述正在看什么，快照描述已经知道什么，草稿描述准备改什么，提交回执描述实际发生了什么。职责分清以后，Vue 的响应式与 TypeScript 的约束才有稳定的落点。</p>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2022/">2022 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/vue/"># Vue</a><a href="/zh/blog/tags/typescript/"># TypeScript</a><a href="/zh/blog/tags/frontend/"># Frontend</a><a href="/zh/blog/tags/architecture/"># Architecture</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#一个审核页为什么会有三份订单状态" class="toc-level-2">一个审核页，为什么会有三份“订单状态”</a><a href="#让状态先表达业务再表达组件" class="toc-level-2">让状态先表达业务，再表达组件</a><a href="#请求返回时还要检查它属于哪次选择" class="toc-level-2">请求返回时，还要检查它属于哪次选择</a><a href="#props事件和接口响应是三种不同的边界" class="toc-level-2">Props、事件和接口响应是三种不同的边界</a><a href="#保存冲突时保留草稿比自动覆盖更有用" class="toc-level-2">保存冲突时，保留草稿比自动覆盖更有用</a><a href="#用坏顺序检验设计是否站得住" class="toc-level-2">用坏顺序检验设计是否站得住</a><a href="#页面复杂度最终体现为修改影响的范围" class="toc-level-2">页面复杂度最终体现为修改影响的范围</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="java-virtual-thread-backpressure"><div class="post-meta"><span class="note-year">2023 · 技术回顾</span><span>6 分钟阅读</span></div><h3><a href="/zh/blog/java-virtual-thread-backpressure/">Java虚拟线程：I/O并发增加后，数据库连接池怎么办</a></h3><p>把虚拟线程的调度能力与下游容量分开，使用有期限的许可控制、入口限流和可验证的资源归还保护服务。</p><div class="post-bottom"><div class="tags"><span>Java</span><span>Concurrency</span><span>Architecture</span><span>Testing</span></div><a class="icon-link" href="/zh/blog/java-virtual-thread-backpressure/" aria-label="阅读全文: Java虚拟线程：I/O并发增加后，数据库连接池怎么办"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="rn-new-architecture-migration"><div class="post-meta"><span class="note-year">2024 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/rn-new-architecture-migration/">React Native新架构迁移：兼容层、原生模块与回归矩阵</a></h3><p>以RN0.76为历史锚点，拆开运行时升级、原生依赖迁移和业务验收，用显式证据门槛避免把能编译误当成迁移完成。</p><div class="post-bottom"><div class="tags"><span>React-Native</span><span>Architecture</span><span>Testing</span><span>Native-Modules</span></div><a class="icon-link" href="/zh/blog/rn-new-architecture-migration/" aria-label="阅读全文: React Native新架构迁移：兼容层、原生模块与回归矩阵"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>

@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>接口重试不是重放：REST错误语义与幂等键设计 — Xiaofeng Qiao</title><meta name="description" content="从请求超时后的结果不确定性出发，设计租户隔离、请求指纹、原子业务写入与可回放收据，并用并发和故障注入验证边界。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/http-idempotency-contract/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/http-idempotency-contract/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="接口重试不是重放：REST错误语义与幂等键设计 — Xiaofeng Qiao"><meta property="og:description" content="从请求超时后的结果不确定性出发，设计租户隔离、请求指纹、原子业务写入与可回放收据，并用并发和故障注入验证边界。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2018 · 技术回顾</span><span>7 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">接口重试不是重放：REST错误语义与幂等键设计</h1><p class="article-deck" itemprop="description">从请求超时后的结果不确定性出发，设计租户隔离、请求指纹、原子业务写入与可回放收据，并用并发和故障注入验证边界。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="超时以后客户端到底知道什么">超时以后，客户端到底知道什么</h2>
+<p>假设一个订单接口已经把订单写入数据库，响应却在返回途中丢失。客户端看见超时，无法据此判断“服务端没收到”“正在处理”还是“已经提交”。这时再发送一次创建请求，可能产生第二张订单；直接提示失败，又可能让用户误以为没有下单。</p>
+<p>本文从 2018 年常见的 HTTP/REST 接口约定出发，在今天重新分析这个问题，使用独立编写的教学模型说明设计。讨论以当时已有的 RFC 7231 为历史基线，复现代码使用本机 Python 3.9.6 和 SQLite。RFC 7231 后来已由 2022 年的 RFC 9110 取代，当前新系统应对照现行规范。<a href="https://www.rfc-editor.org/rfc/rfc7231" rel="noopener noreferrer">历史规范</a>、<a href="https://www.rfc-editor.org/rfc/rfc9110.html" rel="noopener noreferrer">现行 HTTP 语义</a></p>
+<p>这里要先约定两个不同目标：业务效果不重复，以及调用方能找回第一次结果。只用 Redis 记一句“处理过了”，通常只接近前一个目标，而且还要看它与业务写入之间有没有空隙。</p>
+<h2 id="方法语义不会自动补上业务事务">方法语义不会自动补上业务事务</h2>
+<p>HTTP 中的幂等关注重复请求的预期服务端效果，不要求每一次响应内容都相同。例如删除一个资源后再次删除，资源仍然不存在，响应却可以不同。PUT、DELETE 与安全方法具有协议定义的幂等语义；POST 的业务操作若要安全重试，需要另外建立应用契约。不能把“请求用了 PUT”当作底层实现已经正确的证明。<a href="https://www.rfc-editor.org/rfc/rfc7231#section-4.2.2" rel="noopener noreferrer">RFC 7231 §4.2.2</a></p>
+<p>对创建订单，比较实用的约定是：客户端在第一次发送前产生一个业务操作键，所有网络重试复用它；用户真的再下一张订单时才换新键。服务端则把“键、请求指纹、提交结果”作为一份持久收据。本文把 <code>Idempotency-Key</code> 当作双方自定义字段名，不声称它是 2018 年已经标准化的通用 HTTP 请求头。</p>
+<p>同一键必须限定作用域。示例的函数固定处理 <code>POST /orders</code>，数据库再用 <code>(tenant, request_key)</code> 唯一标识一次操作。真实服务若共用收据表，还要纳入操作类型或路由版本。租户身份必须从已完成鉴权的上下文取得，不能相信请求体随意传来的 <code>tenant</code>。</p>
+<h2 id="把同一次定义到数据层">把“同一次”定义到数据层</h2>
+<p>接口至少要回答四个问题：</p>
+<table>
+<thead>
+<tr>
+<th>收到的请求</th>
+<th>本文选择的行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>新键、有效参数</td>
+<td>原子创建订单与收据，返回 201</td>
+</tr>
+<tr>
+<td>同键、相同有效参数</td>
+<td>返回收据中保存的状态码和响应体</td>
+</tr>
+<tr>
+<td>同键、不同参数</td>
+<td>返回业务冲突，HTTP 适配层映射为 409</td>
+</tr>
+<tr>
+<td>参数不合法</td>
+<td>在业务写入前拒绝，适配层映射为 400</td>
+</tr>
+</tbody>
+</table>
+<p>请求指纹应来自经过验证、具有明确含义的业务字段。不能随手对原始 JSON 字符串做哈希，否则字段顺序、空格就可能改变指纹；也不能随意忽略货币、数量单位或接口版本。下例只接受 <code>sku</code> 和正整数 <code>quantity</code>，把可接受输入缩小到容易解释的范围。更复杂的金额应用整数最小货币单位或明确的十进制定点规则，不把二进制浮点数当作金额契约。</p>
+<p>核心实现如下，建表语句应在初始化阶段执行一次：</p>
+<pre><code class="language-sql">CREATE TABLE orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant TEXT NOT NULL, sku TEXT NOT NULL,
+  quantity INTEGER NOT NULL CHECK (quantity &gt; 0)
+);
+CREATE TABLE receipts (
+  tenant TEXT NOT NULL, request_key TEXT NOT NULL,
+  fingerprint TEXT NOT NULL, status INTEGER NOT NULL, body TEXT NOT NULL,
+  PRIMARY KEY (tenant, request_key)
+);
+</code></pre>
+<pre><code class="language-python">import hashlib
+import json
+import sqlite3
+
+class KeyConflict(Exception):
+    pass
+
+def create_order(path, tenant, key, payload):
+    if not tenant or not key or len(key) &gt; 128:
+        raise ValueError(&quot;invalid scope or key&quot;)
+    if not isinstance(payload, dict):
+        raise ValueError(&quot;payload must be an object&quot;)
+    if set(payload) != {&quot;sku&quot;, &quot;quantity&quot;}:
+        raise ValueError(&quot;unexpected or missing field&quot;)
+    if not isinstance(payload[&quot;sku&quot;], str) or not payload[&quot;sku&quot;]:
+        raise ValueError(&quot;invalid sku&quot;)
+    if type(payload[&quot;quantity&quot;]) is not int or payload[&quot;quantity&quot;] &lt;= 0:
+        raise ValueError(&quot;quantity must be a positive integer&quot;)
+    raw = json.dumps(payload, sort_keys=True, separators=(&quot;,&quot;, &quot;:&quot;))
+    fingerprint = hashlib.sha256(raw.encode(&quot;utf-8&quot;)).hexdigest()
+    db = sqlite3.connect(path, isolation_level=None, timeout=10)
+    try:
+        db.execute(&quot;BEGIN IMMEDIATE&quot;)
+        old = db.execute(
+            &quot;SELECT fingerprint, status, body FROM receipts &quot;
+            &quot;WHERE tenant=? AND request_key=?&quot;, (tenant, key)
+        ).fetchone()
+        if old:
+            if old[0] != fingerprint:
+                raise KeyConflict(&quot;key reused with a different payload&quot;)
+            db.commit()
+            return old[1], old[2], True
+        order_id = db.execute(
+            &quot;INSERT INTO orders(tenant, sku, quantity) VALUES (?, ?, ?)&quot;,
+            (tenant, payload[&quot;sku&quot;], payload[&quot;quantity&quot;])
+        ).lastrowid
+        body = json.dumps({&quot;orderId&quot;: order_id}, separators=(&quot;,&quot;, &quot;:&quot;))
+        db.execute(&quot;INSERT INTO receipts VALUES (?, ?, ?, ?, ?)&quot;,
+                   (tenant, key, fingerprint, 201, body))
+        db.commit()
+        return 201, body, False
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+</code></pre>
+<p>这个内核没有监听端口，也没有实现鉴权或 HTTP 错误适配。它刻意把订单与收据放在同一个数据库事务中：要么一起提交，要么一起回滚。SQLite 的 <code>BEGIN IMMEDIATE</code> 提前取得写事务；它的单写者模型使这个小例子容易验证，却不代表多实例生产服务可以不考虑锁竞争、容量和超时。<a href="https://www.sqlite.org/lang_transaction.html" rel="noopener noreferrer">SQLite 事务说明</a>、<a href="https://docs.python.org/3.9/library/sqlite3.html" rel="noopener noreferrer">Python sqlite3 文档</a></p>
+<h2 id="三个容易留下重复副作用的空隙">三个容易留下重复副作用的空隙</h2>
+<p>第一个空隙是先查再写。两个工作进程都查到“键不存在”，然后分别创建业务记录。解决点不是在应用代码多加一次查询，而是让唯一约束和事务决定谁有权执行；把进程内锁当作跨实例锁，重启或扩容后就会失效。</p>
+<p>第二个空隙是业务已提交、收据还没写。此时崩溃，重试找不到收据，就会再做一次。上例用同一事务关闭这一空隙。若业务操作是调用外部系统，本地事务不能回滚远端副作用，需要把待发送事件写入同一事务，再由投递器发送；远端仍要有自己的去重契约。不能给这种组合承诺无条件的“全链路恰好一次”。</p>
+<p>第三个空隙是键过期。保留 24 小时的收据，不等于 25 小时后相同请求就可重新执行。需要同时定义客户端重试窗口、清理策略和超窗后的处理方式；长期业务唯一编号可以作为另一道约束。收据也应只保留找回结果所需的信息，避免复制整份敏感请求。</p>
+<h2 id="重试策略必须服从剩余时间">重试策略必须服从剩余时间</h2>
+<p>客户端不能见到所有 5xx 都无限重试。应把网络错误、服务繁忙、参数冲突分开；对可重试情况设总截止时间、次数上限和带抖动的退避。每一层都重试三次，调用链可能把一次用户动作放大成许多请求。选择一个承担重试预算的层次，比层层“提高可靠性”更容易预测。AWS 官方后续工程文章详细讨论了这种负载放大问题，可作为今天复盘时的延伸阅读。<a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/" rel="noopener noreferrer">Timeouts, retries, and backoff with jitter</a></p>
+<h2 id="验证要刻意丢掉第一次结果">验证要刻意丢掉第一次结果</h2>
+<p>随稿的 <code>examples/http_idempotency.py</code> 使用临时 SQLite 文件，可直接执行：</p>
+<pre><code class="language-bash">python3 examples/http_idempotency.py
+</code></pre>
+<p>八项测试分别检查：新连接回放第一次收据、同键异参拒绝、租户隔离、业务写入后收据写入前故障回滚、八个并发重复调用只创建一张订单、拒绝布尔值数量，以及将顶层 <code>null</code> 和数组都按参数错误拒绝。本次在 Python 3.9.6 执行，八项通过。</p>
+<p>“丢失响应”测试是在提交后忽略第一次返回值，再从新连接重试；它验证持久收据，不是实际断网、杀进程或多机故障演练。完整服务还应测试数据库忙、进程退出、代理超时、收据清理与鉴权隔离。验收时既看返回值，也查订单数和收据数，单独断言“第二次 HTTP 200”抓不住重复业务。</p>
+<h2 id="结论">结论</h2>
+<p>可重试接口的关键是明确地回答：这是不是同一次业务意图，第一次是否已经提交，以及结果怎样找回。HTTP 方法、幂等键、数据库唯一约束、事务与客户端预算分别解决不同问题。把它们的边界写清楚，再用重复和故障验证，接口才具备可讨论的恢复能力。</p>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2018/">2018 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/http/"># HTTP</a><a href="/zh/blog/tags/api/"># API</a><a href="/zh/blog/tags/backend/"># Backend</a><a href="/zh/blog/tags/testing/"># Testing</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#超时以后客户端到底知道什么" class="toc-level-2">超时以后，客户端到底知道什么</a><a href="#方法语义不会自动补上业务事务" class="toc-level-2">方法语义不会自动补上业务事务</a><a href="#把同一次定义到数据层" class="toc-level-2">把“同一次”定义到数据层</a><a href="#三个容易留下重复副作用的空隙" class="toc-level-2">三个容易留下重复副作用的空隙</a><a href="#重试策略必须服从剩余时间" class="toc-level-2">重试策略必须服从剩余时间</a><a href="#验证要刻意丢掉第一次结果" class="toc-level-2">验证要刻意丢掉第一次结果</a><a href="#结论" class="toc-level-2">结论</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="java-future-pools"><div class="post-meta"><span class="note-year">2017 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/java-future-pools/">Java异步任务：CompletableFuture、线程池与超时传播</a></h3><p>从一个有界线程池出发，说明异步组合、队列饱和、等待超时和底层工作取消为什么是四个不同问题。</p><div class="post-bottom"><div class="tags"><span>Java</span><span>Concurrency</span><span>Backend</span><span>Testing</span></div><a class="icon-link" href="/zh/blog/java-future-pools/" aria-label="阅读全文: Java异步任务：CompletableFuture、线程池与超时传播"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="go-cancellation-lifecycle"><div class="post-meta"><span class="note-year">2020 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/go-cancellation-lifecycle/">Go服务如何停止：context取消、goroutine退出与资源归还</a></h3><p>以一个有界并发处理器为例，拆开取消通知、阻塞点退出和完成等待，建立可以验证的资源生命周期。</p><div class="post-bottom"><div class="tags"><span>Go</span><span>Concurrency</span><span>Backend</span><span>Testing</span></div><a class="icon-link" href="/zh/blog/go-cancellation-lifecycle/" aria-label="阅读全文: Go服务如何停止：context取消、goroutine退出与资源归还"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>

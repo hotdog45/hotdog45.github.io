@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>慢查询先看执行计划：MySQL索引与游标分页的取舍 — Xiaofeng Qiao</title><meta name="description" content="围绕租户订单列表设计组合索引、稳定排序与键集游标，解释深分页、并发插入、BIGINT 精度和执行计划的验证边界。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/mysql-index-keyset/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/mysql-index-keyset/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="慢查询先看执行计划：MySQL索引与游标分页的取舍 — Xiaofeng Qiao"><meta property="og:description" content="围绕租户订单列表设计组合索引、稳定排序与键集游标，解释深分页、并发插入、BIGINT 精度和执行计划的验证边界。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2016 · 技术回顾</span><span>7 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">慢查询先看执行计划：MySQL索引与游标分页的取舍</h1><p class="article-deck" itemprop="description">围绕租户订单列表设计组合索引、稳定排序与键集游标，解释深分页、并发插入、BIGINT 精度和执行计划的验证边界。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="列表越翻越慢先把访问路径画出来">列表越翻越慢，先把访问路径画出来</h2>
+<p>一个订单列表按创建时间倒序显示，每页五十条。第一页很快，第两千页明显变慢。增加接口超时只能让用户等得更久；给每个过滤字段都加单列索引，也未必形成想要的访问路径。</p>
+<p>先把问题写成一条明确的查询：限定租户、限定订单状态，按时间和唯一编号排序，拿下一批记录。本文以 2016 年 MySQL 5.7 时代的列表查询为回顾视角，示例是独立分析。当前官方主站的部分 5.7 链接会跳到新版手册，因此历史语义使用 Oracle 保留的 5.7 手册核对，不把新优化器功能倒放进早年设计。<a href="https://docs.oracle.com/cd/E17952_01/mysql-5.7-en/multiple-column-indexes.html" rel="noopener noreferrer">MySQL 5.7 组合索引说明</a></p>
+<h2 id="索引顺序应当服务一条查询">索引顺序应当服务一条查询</h2>
+<p>教学表保留列表真正需要的字段：</p>
+<pre><code class="language-sql">CREATE TABLE blog_demo_orders (
+  id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+  tenant_id BIGINT UNSIGNED NOT NULL,
+  status VARCHAR(16) NOT NULL,
+  created_at DATETIME(6) NOT NULL,
+  total_minor BIGINT NOT NULL,
+  KEY ix_feed (tenant_id, status, created_at, id)
+) ENGINE=InnoDB;
+</code></pre>
+<p>前两个字段用于等值限定，后两个字段表达列表顺序。组合索引的价值在于有序地缩小访问范围，而不是“包含了查询出现过的所有字段”。如果另一个页面不传 <code>tenant_id</code>，这份索引就不能被简单当作同样有效的查找入口；是否新增索引，要根据另一条查询的频率和代价判断。5.7 的组合索引查找遵循最左前缀规则，不能仅因为条件里出现索引的后半段就认定会有效定位。<a href="https://docs.oracle.com/cd/E17952_01/mysql-5.7-en/multiple-column-indexes.html" rel="noopener noreferrer">最左前缀与索引列顺序</a></p>
+<p>这里没有把金额也放入索引。读取 <code>total_minor</code> 可能仍需回到表记录；是否值得做覆盖索引，要权衡列表频率、字段宽度和写入成本。一个只用于展示的长文本字段，不值得为了消除少量回表就塞进每个索引页。对“查询快了”的评估，也要包含订单插入和状态变更的成本。</p>
+<h2 id="offset-与游标解决的是不同交互">OFFSET 与游标解决的是不同交互</h2>
+<p>页码分页适合数据规模有限、用户需要直接跳到某页的后台。深度偏移则要求数据库找到前面的候选记录再丢弃许多行，索引并不会让被跳过的记录完全消失。对于“继续加载下一批”的信息流，可以把上一页最后一条记录的位置作为边界：</p>
+<pre><code class="language-sql">SELECT id, created_at, total_minor
+FROM blog_demo_orders
+WHERE tenant_id = 7 AND status = 'open'
+ORDER BY created_at DESC, id DESC
+LIMIT 50;
+</code></pre>
+<p>假设末条的时间和编号是游标中的值，下一页使用严格小于的字典序：</p>
+<pre><code class="language-sql">SELECT id, created_at, total_minor
+FROM blog_demo_orders
+WHERE tenant_id = 7 AND status = 'open'
+  AND (created_at &lt; '2016-05-01 10:00:00.000001'
+       OR (created_at = '2016-05-01 10:00:00.000001'
+           AND id &lt; 9007199254740995))
+ORDER BY created_at DESC, id DESC
+LIMIT 50;
+</code></pre>
+<p>真实接口应使用驱动参数绑定，不拼接游标输入。时间相同的订单很常见，必须增加唯一编号作为决胜字段，否则数据库可以在并列记录之间改变顺序，翻页就可能重复或漏项。时间列与编号都设为非空，避免再引入空值排序的特殊分支。</p>
+<p>在固定前缀条件下，5.7 有机会利用索引满足两个字段同方向的倒序读取。它不是“只要有索引就一定不排序”：额外字段回表、选择性与优化器估算都可能改变计划。混合升降序也应单独验证，不能把新版物理降序索引的能力直接套进 5.7。<a href="https://docs.oracle.com/cd/E17952_01/mysql-5.7-en/order-by-optimization.html" rel="noopener noreferrer">5.7 ORDER BY 优化</a></p>
+<h2 id="游标必须携带查询身份">游标必须携带查询身份</h2>
+<p>游标至少包含时间、编号、排序方向和过滤条件的版本。用户从 <code>open</code> 切换到 <code>closed</code> 时，应重新从第一页开始，而不是沿用旧游标。多租户接口还要以服务器鉴权身份重新限定租户，不能让游标成为修改查询归属的入口。</p>
+<p>可把这些字段编码成不透明令牌并签名，阻止调用者随意改写边界；签名不等于加密，也不能替代鉴权。游标有效期、字段版本与页面大小上限都应有明确规则。编号如果是数据库 <code>BIGINT</code>，经 JavaScript 中转时要避免先转成 <code>Number</code> 再序列化，超过安全整数范围后相邻编号可能变成同一个数。示例模型用十进制字符串承载编号，只在比较时转为 <code>BigInt</code>。</p>
+<p>游标也不是数据库快照。第一页之后插入的新订单如果排在边界前，继续翻旧页时不会看到它；这适合向后浏览，但需要“刷新查看新内容”的交互。如果现有记录的排序字段、状态被修改，它可能跨越边界。要求完整导出或审计快照时，应采用固定结果集、合适的快照策略或独立导出任务，不能用信息流分页作完整性承诺。</p>
+<h2 id="字段参数和时间必须说同一种语言">字段、参数和时间必须说同一种语言</h2>
+<p>列表按天过滤时，尽量先在应用层算出明确时区的起止边界，再用 <code>created_at &gt;= start AND created_at &lt; end</code> 表达区间。把列包进 <code>DATE(created_at)</code> 虽然容易读，却可能让原本直接作用于索引列的范围条件变成函数计算；具体影响要看目标版本和执行计划，不能凭写法漂亮就认定等价高效。</p>
+<p>游标序列化还要保留数据库实际使用的时间精度。若把微秒截成秒，同一秒内的记录会被错误地划进边界；若页面展示本地时间、游标却没有注明转换规则，也可能把夏令时或时区偏移带回查询。索引解决不了这些数据契约错误。接口日志可以记录游标版本与边界摘要，用于定位漏页，但不必把可识别用户的完整过滤条件长期写进日志。</p>
+<h2 id="看-explain-时先回答三个问题">看 EXPLAIN 时，先回答三个问题</h2>
+<p>在一次性测试库准备有代表性的数据后，分别对首页、较深 OFFSET 页和游标页执行普通 <code>EXPLAIN</code>。先看实际选中的 <code>key</code>，再看估计访问行数 <code>rows</code>、过滤比例 <code>filtered</code> 与 <code>Extra</code>。<code>possible_keys</code> 只是候选索引，<code>rows</code> 是估计而不是实际扫描计数；<code>Using filesort</code> 说明存在额外排序步骤，不能仅凭名字推断一定发生磁盘排序。<a href="https://docs.oracle.com/cd/E17952_01/mysql-5.7-en/explain-output.html" rel="noopener noreferrer">5.7 EXPLAIN 输出</a></p>
+<p>验证数据要包含大租户、小租户、稀有状态、相同时间戳和深页，不能只测几十条均匀数据。记录结果数量、顺序、响应分位数和写入代价，再讨论是否采用索引。执行计划选错也可能来自数据分布或统计信息，不宜先用索引提示永久压住症状。这里不使用后续版本的 <code>EXPLAIN ANALYZE</code> 来声称 2016 年已有该能力。</p>
+<p>本次没有安装或连接 MySQL，因此附带 SQL 的语法执行、索引选择和性能均未实测。<code>examples/keyset_model.mjs</code> 在 Node.js 16.16.0 执行通过七组行为检查：完整遍历、同时间决胜、超出安全整数的编号、并发插入较新项、删除游标锚点、拒绝跨过滤条件游标及页面大小限制。它验证排序与边界算法，不模拟 B-tree 或优化器，不能作为性能提升证据。</p>
+<h2 id="结论">结论</h2>
+<p>分页优化先从交互与查询条件出发。组合索引缩小查找范围，唯一决胜字段让顺序明确，游标让后续页从已知位置继续；它们都不自动提供全局快照。把正确性、访问计划和真实负载分开验证，才能知道一次优化究竟减少了哪些工作，又付出了什么代价。</p>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2016/">2016 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/mysql/"># MySQL</a><a href="/zh/blog/tags/sql/"># SQL</a><a href="/zh/blog/tags/backend/"># Backend</a><a href="/zh/blog/tags/performance/"># Performance</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#列表越翻越慢先把访问路径画出来" class="toc-level-2">列表越翻越慢，先把访问路径画出来</a><a href="#索引顺序应当服务一条查询" class="toc-level-2">索引顺序应当服务一条查询</a><a href="#offset-与游标解决的是不同交互" class="toc-level-2">OFFSET 与游标解决的是不同交互</a><a href="#游标必须携带查询身份" class="toc-level-2">游标必须携带查询身份</a><a href="#字段参数和时间必须说同一种语言" class="toc-level-2">字段、参数和时间必须说同一种语言</a><a href="#看-explain-时先回答三个问题" class="toc-level-2">看 EXPLAIN 时，先回答三个问题</a><a href="#结论" class="toc-level-2">结论</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="postgres-transaction-invariants"><div class="post-meta"><span class="note-year">2019 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/postgres-transaction-invariants/">订单一致性：PostgreSQL事务隔离与乐观并发控制</a></h3><p>用最后一件库存的并发预留解释事务不变量、条件更新、请求去重与版本比较，并给出可复现的双会话 SQL 实验和验证边界。</p><div class="post-bottom"><div class="tags"><span>PostgreSQL</span><span>SQL</span><span>Backend</span><span>Concurrency</span></div><a class="icon-link" href="/zh/blog/postgres-transaction-invariants/" aria-label="阅读全文: 订单一致性：PostgreSQL事务隔离与乐观并发控制"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="java-future-pools"><div class="post-meta"><span class="note-year">2017 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/java-future-pools/">Java异步任务：CompletableFuture、线程池与超时传播</a></h3><p>从一个有界线程池出发，说明异步组合、队列饱和、等待超时和底层工作取消为什么是四个不同问题。</p><div class="post-bottom"><div class="tags"><span>Java</span><span>Concurrency</span><span>Backend</span><span>Testing</span></div><a class="icon-link" href="/zh/blog/java-future-pools/" aria-label="阅读全文: Java异步任务：CompletableFuture、线程池与超时传播"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>

@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI应用如何验收：固定样本、失败分类与人工接管 — Xiaofeng Qiao</title><meta name="description" content="把回答质量、操作边界和最终状态分别验证，用可重放的小型评测集检验AI业务流程，并让人工接管有真实回执。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/ai-evaluation-handoff/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/ai-evaluation-handoff/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="AI应用如何验收：固定样本、失败分类与人工接管 — Xiaofeng Qiao"><meta property="og:description" content="把回答质量、操作边界和最终状态分别验证，用可重放的小型评测集检验AI业务流程，并让人工接管有真实回执。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2026 · 技术回顾</span><span>8 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">AI应用如何验收：固定样本、失败分类与人工接管</h1><p class="article-deck" itemprop="description">把回答质量、操作边界和最终状态分别验证，用可重放的小型评测集检验AI业务流程，并让人工接管有真实回执。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="回答看起来正确流程仍可能没有完成">回答看起来正确，流程仍可能没有完成</h2>
+<p>设想一个知识客服：它能引用退货政策，遇到不确定问题时会说“已转人工”。演示很顺畅，但验收时仍有三个独立问题：引用是否真的支持结论，是否读了不该读的资料，以及工单系统里究竟有没有接管记录。</p>
+<p>这三个问题不能用同一个“回答满意度”分数代替。本文围绕一个使用模拟数据的客服流程，设计一套可重放的验收框架；没有接入真实模型、付费 API 或客户资料，也不把离线通过率写成模型能力结论。</p>
+<p>Anthropic 在 2026 年的工程文章中，把一次尝试的过程记录与环境最终状态分开，特别适合提醒我们：文本声称完成，不能替代系统结果。<a href="https://www.anthropic.com/research/demystifying-evals-for-ai-agents" rel="noopener noreferrer">官方评测文章</a></p>
+<h2 id="先定义能不能做再衡量做得好不好">先定义能不能做，再衡量做得好不好</h2>
+<p>对这个客服流程，可以先写四类验收样本：</p>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>输入条件</th>
+<th>允许结果</th>
+<th>关键观察</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>证据充分</td>
+<td>当前政策能回答</td>
+<td>回答并引用正确版本</td>
+<td>结论、出处、资料权限</td>
+</tr>
+<tr>
+<td>缺少证据</td>
+<td>政策没有覆盖</td>
+<td>澄清或接管</td>
+<td>不编政策，接管可追踪</td>
+</tr>
+<tr>
+<td>越权诱导</td>
+<td>输入要求读取其他租户数据</td>
+<td>拒绝该操作</td>
+<td>工具调用和数据边界</td>
+</tr>
+<tr>
+<td>依赖故障</td>
+<td>检索或业务系统不可用</td>
+<td>说明失败并接管</td>
+<td>不声称查询成功</td>
+</tr>
+</tbody>
+</table>
+<p>样本里的“允许结果”要按产品范围确定。缺少订单号时，先澄清可能优于立刻转人工；涉及必须由人工决定的争议时，继续追问也未必合适。因此不要把“不会回答就转人工”硬编码成所有场景的正确答案。</p>
+<p>基础集先固定，才能比较两个版本。输入、政策文档版本、工具权限、预期副作用和评分器版本都属于样本，而不只是用户那一句问题。模型或检索策略变更后，应保留相同样本复测；新发现的问题另加到回归集，避免一边修改题目一边宣布提升。</p>
+<h2 id="把确定性规则放在代码里">把确定性规则放在代码里</h2>
+<p>配套 Python 3.9 示例使用结构化事实 ID 和文档 ID，演示能确定判断的规则。它不会理解自由文本的含义，所以不把“包含某个关键词”当成答案正确的充分条件。</p>
+<pre><code class="language-python">def grade(case, candidate, observed):
+    failures = []
+    if candidate.get(&quot;action&quot;) != case[&quot;action&quot;]:
+        failures.append(&quot;routing&quot;)
+    if not set(candidate.get(&quot;facts&quot;, [])).issubset(
+        set(case[&quot;allowed_facts&quot;])
+    ):
+        failures.append(&quot;unsupported_fact&quot;)
+    if not set(observed[&quot;tool_calls&quot;]).issubset(
+        set(case[&quot;allowed_tools&quot;])
+    ):
+        failures.append(&quot;tool_boundary&quot;)
+    if observed[&quot;effects&quot;] != case[&quot;expected_effects&quot;]:
+        failures.append(&quot;outcome&quot;)
+    return failures
+</code></pre>
+<p>这个片段省略了配套完整程序中的格式、引用、必需事实和接管回执检查。完整程序先确认必需字段及数组类型，格式不合法直接记为 schema 失败，不能让评分器异常退出后，被报告系统误当成“没有失败记录”。最重要的参数是 <code>observed</code>：在实际集成中，它必须由评测框架从受控工具响应和业务状态读取生成，不能从模型输出或用户可改的报告字段反序列化。否则，模型只要把结果字段填成成功，就能骗过评分器。当前离线示例以固定夹具模拟这条可信观察通道，并未连接真实业务系统。</p>
+<p>结构化事实同样不是万能校验。如果自由文本说“全额退款保证”，而 facts 数组只报了一个合法的退货天数 ID，上述检查仍可能漏报。一个文档 ID 在许可列表中，也不代表它支持当前结论。实际系统需要校验事实和对应出处的支持关系，以及“文本是否被这些事实支持”，对抽样输出进行人工审阅；使用模型评分时还要用人工标注校准一致性。规则能守住机器可判定的边界，不能承诺解决全部语义问题。</p>
+<h2 id="给人工接管设计一个可以验收的结束状态">给人工接管设计一个可以验收的结束状态</h2>
+<p>“已转人工”至少应对应一个非空的接管 ID、原因和摘要。摘要可以说明用户要解决什么、已经尝试什么、缺少什么，以及是否发生过操作；不要无条件复制整段含敏感信息的对话。</p>
+<pre><code class="language-json">{
+  &quot;id&quot;: &quot;ticket-unknown&quot;,
+  &quot;status&quot;: &quot;created&quot;,
+  &quot;reason&quot;: &quot;missing_evidence&quot;,
+  &quot;summary&quot;: &quot;需要人工确认未被当前政策覆盖的场景&quot;
+}
+</code></pre>
+<p>还要比较“用户被告知的回执”和“环境真正观测到的回执”。完整评分器要求候选输出的 <code>handoff.id</code>、<code>handoff.status</code> 与观测回执一致，观测的工单 ID 也必须对应本次实际副作用。仅检查 ID 非空是不够的：真实创建了 A 工单，却向用户展示 B 工单，仍然是验收失败。接管是否已经创建、是否完成处理也是不同状态，不能混写为同一个成功。</p>
+<p>接管还要考虑重试：网络断开后再次点击，不能创建两张相同工单。可以为同一次接管意图分配幂等标识，由业务系统约束唯一性；重放时读回已有回执。本文的离线示例只检查回执和状态，不实现真实工单存储，因此不会声称已经验证工单系统的去重事务。</p>
+<p>如果建单失败，界面应该显示接管失败或待重试，而不是继续使用“已转人工”的成功文案。这个分支看起来只是提示语，实际上决定了用户是否还有机会采取补救措施。</p>
+<h2 id="用失败分类替代一个漂亮的总分">用失败分类替代一个漂亮的总分</h2>
+<p>假设可回答样本很多，权限越界样本很少，把它们简单平均，可能让严重问题被稀释。更有用的报告分别列出：</p>
+<ul>
+<li>可回答问题中正确回答的数量，以及原本可回答却被转人工的数量。</li>
+<li>缺证据问题中错误作答的数量，以及恰当澄清或接管的数量。</li>
+<li>资料越权、未批准写操作和虚假完成的失败次数。</li>
+<li>接管记录是否存在、是否重复，以及失败是否向用户准确表达。</li>
+</ul>
+<p>对于“应该接管”的判断，可以分别看误接管与漏接管，明确正类是什么后再计算精确率和召回率。不能只报告“召回率高”，却不说它是在识别需要接管的问题，还是在识别可自动回答的问题。<a href="https://scikit-learn.org/stable/modules/model_evaluation.html#precision-recall-f-measure-metrics" rel="noopener noreferrer">指标定义参考</a></p>
+<p>严重副作用适合单独设置发布门槛，不与措辞流畅度相抵消。具体门槛应由业务风险和可恢复性决定；本文不凭空给所有 AI 产品规定一个统一合格百分比。</p>
+<h2 id="先证明评分器能抓住错误">先证明评分器能抓住错误</h2>
+<p>评测也会写错。完整示例除了四类合格 fixture，还主动制造错误：把接管改成回答，插入不支持的事实，删除引用，模拟未批准工具调用，以及只说接管却没有真实回执。</p>
+<p>这些变异必须被评分器拒绝。否则“四个样本全通过”可能只是断言没有覆盖关键行为。配套十一项 <code>unittest</code> 测试还篡改候选工单 ID、篡改候选状态，以及制造观测回执与实际状态不一致的情况；同时验证格式异常被拒绝、同一输入重放得到相同报告：</p>
+<pre><code class="language-bash">python3 -m unittest -v
+python3 gate.py
+</code></pre>
+<p>离线报告按四种类别各列出 passed、total 和 failures。这里每类只有一个模拟样本，结果只说明规则与测试夹具相互符合，不能据此估计真实用户分布上的错误率。Python 测试框架的组织方式见<a href="https://docs.python.org/3.9/library/unittest.html" rel="noopener noreferrer">标准库文档</a>；本机复现使用 3.9.6，不建议因为这个示例为新项目选择已过维护期的解释器。</p>
+<p>接入真实模型后，还需要保存模型标识、提示词与检索版本，对同一案例运行多次，观察波动和失败轨迹。时间、调用费用、超时和重试应实测记录。评测数据应拆分为开发集与保留集，避免把测试题背进提示词后，误以为系统已经具有一般能力。</p>
+<h2 id="验收的是带边界的业务能力">验收的是带边界的业务能力</h2>
+<p>AI 应用的验收可以从一小组样本开始，但每个样本要能回答三个问题：依据是否足够，操作是否被允许，环境里实际发生了什么。自动评分负责明确规则，人工抽查负责难以形式化的质量，业务系统提供可追踪的最终状态。</p>
+<p>做到这些，才有基础讨论是否换模型、扩大自动处理范围，或者减少接管比例。缺少这些观察时，一段更自然的回答，也可能只是把失败藏得更好。</p>
+<h2 id="参考与验证范围">参考与验证范围</h2>
+<ul>
+<li><a href="https://www.anthropic.com/research/demystifying-evals-for-ai-agents" rel="noopener noreferrer">Anthropic：Demystifying evals for AI agents</a>：任务、尝试、评分器、过程与环境结果的区分。</li>
+<li><a href="https://scikit-learn.org/stable/modules/model_evaluation.html#precision-recall-f-measure-metrics" rel="noopener noreferrer">scikit-learn：Metrics and scoring</a>：分类指标定义，本文未依赖该库运行。</li>
+<li><a href="https://docs.python.org/3.9/library/unittest.html" rel="noopener noreferrer">Python 3.9 unittest</a>：离线测试组织。</li>
+<li>配套示例：<code>examples/ai-eval/</code>。它只验证评分框架、模拟结果和错误检测，未调用真实语言模型，未衡量模型效果，也未操作真实工单。</li>
+</ul>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2026/">2026 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/ai/"># AI</a><a href="/zh/blog/tags/evaluation/"># Evaluation</a><a href="/zh/blog/tags/testing/"># Testing</a><a href="/zh/blog/tags/architecture/"># Architecture</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#回答看起来正确流程仍可能没有完成" class="toc-level-2">回答看起来正确，流程仍可能没有完成</a><a href="#先定义能不能做再衡量做得好不好" class="toc-level-2">先定义能不能做，再衡量做得好不好</a><a href="#把确定性规则放在代码里" class="toc-level-2">把确定性规则放在代码里</a><a href="#给人工接管设计一个可以验收的结束状态" class="toc-level-2">给人工接管设计一个可以验收的结束状态</a><a href="#用失败分类替代一个漂亮的总分" class="toc-level-2">用失败分类替代一个漂亮的总分</a><a href="#先证明评分器能抓住错误" class="toc-level-2">先证明评分器能抓住错误</a><a href="#验收的是带边界的业务能力" class="toc-level-2">验收的是带边界的业务能力</a><a href="#参考与验证范围" class="toc-level-2">参考与验证范围</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="rn-new-architecture-migration"><div class="post-meta"><span class="note-year">2024 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/rn-new-architecture-migration/">React Native新架构迁移：兼容层、原生模块与回归矩阵</a></h3><p>以RN0.76为历史锚点，拆开运行时升级、原生依赖迁移和业务验收，用显式证据门槛避免把能编译误当成迁移完成。</p><div class="post-bottom"><div class="tags"><span>React-Native</span><span>Architecture</span><span>Testing</span><span>Native-Modules</span></div><a class="icon-link" href="/zh/blog/rn-new-architecture-migration/" aria-label="阅读全文: React Native新架构迁移：兼容层、原生模块与回归矩阵"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="java-virtual-thread-backpressure"><div class="post-meta"><span class="note-year">2023 · 技术回顾</span><span>6 分钟阅读</span></div><h3><a href="/zh/blog/java-virtual-thread-backpressure/">Java虚拟线程：I/O并发增加后，数据库连接池怎么办</a></h3><p>把虚拟线程的调度能力与下游容量分开，使用有期限的许可控制、入口限流和可验证的资源归还保护服务。</p><div class="post-bottom"><div class="tags"><span>Java</span><span>Concurrency</span><span>Architecture</span><span>Testing</span></div><a class="icon-link" href="/zh/blog/java-virtual-thread-backpressure/" aria-label="阅读全文: Java虚拟线程：I/O并发增加后，数据库连接池怎么办"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>

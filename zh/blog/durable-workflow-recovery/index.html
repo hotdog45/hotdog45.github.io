@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>长流程任务的恢复：持久化状态、补偿与重复执行 — Xiaofeng Qiao</title><meta name="description" content="从等待审批到跨系统效果，把恢复位置、未知结果与补偿进度写进可验证的持久化状态机。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/durable-workflow-recovery/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/durable-workflow-recovery/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="长流程任务的恢复：持久化状态、补偿与重复执行 — Xiaofeng Qiao"><meta property="og:description" content="从等待审批到跨系统效果，把恢复位置、未知结果与补偿进度写进可验证的持久化状态机。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2025 · 技术回顾</span><span>6 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">长流程任务的恢复：持久化状态、补偿与重复执行</h1><p class="article-deck" itemprop="description">从等待审批到跨系统效果，把恢复位置、未知结果与补偿进度写进可验证的持久化状态机。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="一个等待审批的流程不能靠函数栈活着">一个等待审批的流程，不能靠函数栈活着</h2>
+<p>考虑一项模拟资源开通任务：先等待审核人确认规格，再预留资源，最后激活。审批可能隔天才到；工作进程可能在预留成功后重启；激活失败以后，还要归还属于本任务的预留。把这三步写在一个长函数里，再在异常处调用取消，无法回答恢复时最重要的问题：哪一步已经产生效果，哪个决定仍然有效？</p>
+<p>本文是 2026 年编写、面向 2025 年长流程工程主题的分析示例。使用 Python 3.9 兼容代码与两个临时 SQLite 数据库，分别模拟编排器和资源提供者；不连接实际云资源。示例故意保留两个提交边界，避免在一个事务里假装解决了跨系统一致性。</p>
+<h2 id="状态描述下一步允许做什么">状态描述下一步允许做什么</h2>
+<p>状态集合要能指导恢复，而不仅是给页面配颜色。<code>WAIT_APPROVAL</code> 表示不能调用资源服务；<code>RESERVE_PENDING</code> 表示审批已保存，可以尝试预留；<code>ACTIVATE_PENDING</code> 表示可以继续激活；<code>RECONCILE</code> 表示效果未知，需要查询；<code>COMPENSATE_PENDING</code> 表示补偿尚未完成。<code>DONE</code>、<code>CANCELLED</code>、<code>EXPIRED</code> 是本例终态。</p>
+<pre><code class="language-text">WAIT_APPROVAL → RESERVE_PENDING → ACTIVATE_PENDING → DONE
+       ↓                               ↓           ↑
+    EXPIRED                         RECONCILE ──────┘
+                                       （查询确认激活）
+ACTIVATE_PENDING → COMPENSATE_PENDING → CANCELLED
+                   （明确拒绝后释放自己的预留）
+</code></pre>
+<p><code>RECONCILE</code> 没有直接通向取消的箭头：超时只说明没有收到确定答复。实际已经激活的资源，不能因为编排器着急收尾就按“预留失败”释放。查询仍不可用时，流程停在可解释的等待状态，交给运维恢复查询或人工核对。</p>
+<h2 id="审批绑定输入恢复不扩大授权">审批绑定输入，恢复不扩大授权</h2>
+<p>示例保存工作流 ID、输入摘要、修订号、审批人、审批截止时间和当前状态。审批入口比较摘要与修订号，并在同一数据库事务中保存审批结果和下一状态。同一个 ID 的规格改变会被拒绝；新规格需要新的版本与审批。</p>
+<pre><code class="language-python">if row['state'] != 'WAIT_APPROVAL' or row['spec_hash'] != spec_hash or row['revision'] != revision:
+    raise ValueError('stale approval')
+if now &gt;= row['expires']:
+    self._state(flow, 'EXPIRED', 'approval deadline')
+    return 'EXPIRED'
+self.db.execute('UPDATE flows SET approver=? WHERE id=?', (actor, flow))
+self._state(flow, 'RESERVE_PENDING', 'approved exact revision')
+</code></pre>
+<p>这段摘录位于事务上下文内，完整代码见随文示例。<code>actor</code> 必须由已认证的宿主入口提供；本地固定审核人只是测试夹具，不是可部署的身份认证。这里的期限是“接受审批的期限”，并未实现执行窗口或后续撤销授权；若业务需要这些语义，应另建状态与校验，不能从一个 <code>expires</code> 字段推导全部权限。</p>
+<h2 id="最危险的窗口在两次提交之间">最危险的窗口在两次提交之间</h2>
+<p>预留操作采用稳定键 <code>job-7:reserve:v1</code>。提供者先提交自己的数据库，编排器随后才把状态改为 <code>ACTIVATE_PENDING</code>。测试在这两步之间主动抛出异常，再关闭并重新打开两个连接。恢复看到的仍是 <code>RESERVE_PENDING</code>，因而重发同一个操作键；提供者返回既有预留，不再增加资源。</p>
+<p>本地日志写了“准备调用”不能证明外部调用成功；日志写了“调用失败”也不能证明外部没有效果。稳定键的有效期、同键输入冲突规则、查询接口的可信度，都是提供者契约的一部分。若真实服务不支持它们，就需要额外的对账或人工处理路径，不能只在编排器中加一个 <code>done</code> 字段。</p>
+<p>SQLite 能把单个数据库中的状态与历史记录一起提交，但不会让另一个数据库自动参与同一原子事务。示例的每条状态转换同时追加历史，方便解释“为什么现在在这里”；资源操作放在这些短事务之外，不持有数据库写锁等待远端响应。<a href="https://www.sqlite.org/lang_transaction.html" rel="noopener noreferrer">SQLite 事务文档</a>说明了事务和单写者边界。</p>
+<h2 id="补偿是新的业务动作也可能失败">补偿是新的业务动作，也可能失败</h2>
+<p>激活接口明确返回 <code>rejected</code> 时，夹具契约保证激活没有发生，才转入补偿。释放动作只允许把本工作流预留从 <code>reserved</code> 改为 <code>released</code>，不会恢复整个资源表的旧快照，也不会触碰其他工作流。补偿异常时保留 <code>COMPENSATE_PENDING</code>，下次仍从这里尝试。</p>
+<pre><code class="language-python">elif state == 'COMPENSATE_PENDING':
+    self.provider.release(op)
+    with self.db:
+        self._state(flow, 'CANCELLED', 'owned reservation released')
+</code></pre>
+<p>如果释放已成功而本地尚未记录，重试释放也必须安全。示例提供者允许重复释放，并检查最终状态。工程上还要区分不可逆步骤，确定哪些取消需要业务批准。<a href="https://learn.microsoft.com/en-us/azure/architecture/patterns/compensating-transaction" rel="noopener noreferrer">微软的补偿事务模式</a>强调补偿与领域规则有关，补偿本身也要记录进度并可恢复；它不等价于数据库回滚。</p>
+<p>另一条失败路径是“激活已提交，但答复丢失”。本例进入 <code>RECONCILE</code>，查询到 <code>active</code> 才完成；查询返回空或仍为预留时也不会擅自补偿，因为真实提供者可能存在传播延迟。生产系统应定义查询的一致性、最长等待与人工裁决入口，避免无限沉默。</p>
+<h2 id="怎样验证恢复而不只验证正常顺序">怎样验证恢复，而不只验证正常顺序</h2>
+<p>完整示例位于 <code>examples/durable-workflow/</code>，在临时目录内运行：</p>
+<pre><code class="language-sh">cd examples/durable-workflow
+/usr/bin/python3 -m unittest -v
+</code></pre>
+<p>实际使用 Python 3.9.6 执行 6 项测试，通过情况包括：等待审批跨重启后仍无外部效果；变更输入、旧修订和非审核人被拒绝；预留提交窗口中断后仅留一个效果；补偿失败后重启继续；激活答复丢失先等待查询；终态重复推进不追加历史。测试还确认另一个工作流仍处于自己的等待状态。</p>
+<p>这些是受控故障与连接重开验证，未验证断电、磁盘损坏、多工作进程竞争或真实远端服务。扩展到多执行者时，需要抢占租约、版本比较及过期执行者隔离；仅靠 SQLite 单写者无法保证同一个业务任务不会被两个进程同时推进。</p>
+<h2 id="什么时候引入成熟工作流引擎">什么时候引入成熟工作流引擎</h2>
+<p>只有少量审批与一个受控提供者时，显式状态表更容易审查。步骤多、等待长、计时器与部署版本兼容复杂时，成熟引擎能降低自建调度成本。Temporal 的官方文档解释了事件历史与重放如何支撑恢复；本文并未运行 Temporal，也不把这里的简单状态机称作它的等价实现。<a href="https://docs.temporal.io/workflow-execution" rel="noopener noreferrer">Temporal 执行与重放说明</a></p>
+<p>恢复设计的验收标准，是进程消失后仍能回答“下一步允许做什么、已有哪项可信效果、哪些需要核对”。把审批、未知结果与补偿进度保存下来，任务才有清楚的继续位置。</p>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2025/">2025 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/workflow/"># Workflow</a><a href="/zh/blog/tags/backend/"># Backend</a><a href="/zh/blog/tags/python/"># Python</a><a href="/zh/blog/tags/recovery/"># Recovery</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#一个等待审批的流程不能靠函数栈活着" class="toc-level-2">一个等待审批的流程，不能靠函数栈活着</a><a href="#状态描述下一步允许做什么" class="toc-level-2">状态描述下一步允许做什么</a><a href="#审批绑定输入恢复不扩大授权" class="toc-level-2">审批绑定输入，恢复不扩大授权</a><a href="#最危险的窗口在两次提交之间" class="toc-level-2">最危险的窗口在两次提交之间</a><a href="#补偿是新的业务动作也可能失败" class="toc-level-2">补偿是新的业务动作，也可能失败</a><a href="#怎样验证恢复而不只验证正常顺序" class="toc-level-2">怎样验证恢复，而不只验证正常顺序</a><a href="#什么时候引入成熟工作流引擎" class="toc-level-2">什么时候引入成熟工作流引擎</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="mcp-tool-boundaries"><div class="post-meta"><span class="note-year">2025 · 技术回顾</span><span>6 分钟阅读</span></div><h3><a href="/zh/blog/mcp-tool-boundaries/">MCP工具接入：参数校验、最小权限与不可信内容</a></h3><p>以固定版本规范和离线工具网关为例，分开工具发现、身份权限、具体操作确认与真实执行结果。</p><div class="post-bottom"><div class="tags"><span>MCP</span><span>AI</span><span>Security</span><span>Backend</span></div><a class="icon-link" href="/zh/blog/mcp-tool-boundaries/" aria-label="阅读全文: MCP工具接入：参数校验、最小权限与不可信内容"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="web3-event-reconciliation"><div class="post-meta"><span class="note-year">2025 · 技术回顾</span><span>6 分钟阅读</span></div><h3><a href="/zh/blog/web3-event-reconciliation/">Web3 交易状态设计：从钱包确认到链上事件对账</a></h3><p>把登录签名、交易提交、区块确认与业务入账分开设计，讨论账户切换、日志去重、链重组和金额精度，避免把一个交易哈希误当成最终成功。</p><div class="post-bottom"><div class="tags"><span>Web3</span><span>TypeScript</span><span>Backend</span><span>Reliability</span></div><a class="icon-link" href="/zh/blog/web3-event-reconciliation/" aria-label="阅读全文: Web3 交易状态设计：从钱包确认到链上事件对账"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>

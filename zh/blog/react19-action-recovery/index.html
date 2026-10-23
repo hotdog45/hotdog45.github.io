@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>React19表单交互：乐观更新、失败恢复与服务端约定 — Xiaofeng Qiao</title><meta name="description" content="利用 Actions、useActionState 和 useOptimistic 表达提交过程，同时保留草稿、区分未知结果与业务冲突，并用稳定操作键控制失败后的重试。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/react19-action-recovery/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/react19-action-recovery/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="React19表单交互：乐观更新、失败恢复与服务端约定 — Xiaofeng Qiao"><meta property="og:description" content="利用 Actions、useActionState 和 useOptimistic 表达提交过程，同时保留草稿、区分未知结果与业务冲突，并用稳定操作键控制失败后的重试。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2024 · 技术回顾</span><span>8 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">React19表单交互：乐观更新、失败恢复与服务端约定</h1><p class="article-deck" itemprop="description">利用 Actions、useActionState 和 useOptimistic 表达提交过程，同时保留草稿、区分未知结果与业务冲突，并用稳定操作键控制失败后的重试。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="更少的-loading-代码并不自动带来可靠保存">更少的 loading 代码，并不自动带来可靠保存</h2>
+<p>表单提交后立刻把新名字放进列表，会让界面感觉很快。随后接口失败，临时行应该怎样撤回？用户输入是否还在？如果服务端其实已经保存，只是响应丢了，再点一次会不会创建两条记录？这些问题不会因为换成新 Hook 就消失。</p>
+<p>React 19 在 2024 年 12 月正式稳定，Actions、<code>useActionState</code>、<code>useOptimistic</code> 与表单协作是其中的重要能力。本文以这个稳定版本提供的基础接口为回顾范围，使用今天编写的独立分析示例；当前文档中的后续扩展不作为 2024 年已经存在的依据。<a href="https://react.dev/blog/2024/12/05/react-19" rel="noopener noreferrer">React 19 发布记录</a></p>
+<h2 id="先把三个层次分开">先把三个层次分开</h2>
+<p>用户正在编辑的草稿、请求期间的乐观显示、服务端确认的记录，是三份含义不同的数据。草稿应由明确的输入状态持有；乐观行应标为“保存中”；只有有效回执才能进入已确认记录。若把临时行直接塞进持久列表，再靠错误分支删回来，很容易漏掉一个失败路径。</p>
+<p><code>useActionState</code> 把 Action 的结果与 pending 状态连接到组件。Action 函数接收的第一个参数是前一次状态，后面才是提交载荷；直接把原本只接收 <code>FormData</code> 的函数塞进去，可能读错参数。<a href="https://react.dev/reference/react/useActionState" rel="noopener noreferrer">useActionState 参数约定</a></p>
+<p>这里的 Action 是客户端函数，它调用注入的 <code>save</code> 接口。把函数放进 <code>&lt;form action&gt;</code> 不会自动创建数据库事务或服务器鉴权。框架的 Server Function 还涉及部署与服务端边界，不应和普通客户端 Action 混为一谈。<a href="https://react.dev/reference/react-dom/components/form" rel="noopener noreferrer">表单 Action 与 Server Function</a></p>
+<h2 id="用结构化结果表达恢复路径">用结构化结果表达恢复路径</h2>
+<p>下面的动作函数先验证输入，再发布临时显示，最后检查回执。教学接口约定：成功保存标准化后的姓名，并返回非空字符串编号；若服务端另做规范化，接口还应返回最终姓名，界面据此更新。</p>
+<pre><code class="language-javascript">function makeSaveAction(save, onOptimistic = () =&gt; {}) {
+  return async function action(previous, formData) {
+    if (!formData || typeof formData.get !== 'function') {
+      return { kind: 'invalid', message: '表单结构错误' };
+    }
+    const rawName = formData.get('name');
+    const rawKey = formData.get('requestKey');
+    if (typeof rawName !== 'string' || typeof rawKey !== 'string') {
+      return { kind: 'invalid', message: '请检查输入类型' };
+    }
+    const name = rawName.trim(), requestKey = rawKey.trim();
+    if (!name || name.length &gt; 80
+        || !/^[a-zA-Z0-9_-]{8,128}$/.test(requestKey)) {
+      return { kind: 'invalid', message: '请检查姓名和操作标识' };
+    }
+    onOptimistic({ name, requestKey });
+    try {
+      const receipt = await save({ name, requestKey });
+      if (!receipt || typeof receipt.id !== 'string' || !receipt.id) {
+        return { kind: 'uncertain', message: '结果未确认，请用同一操作重试' };
+      }
+      return { kind: 'saved', receipt: { id: receipt.id, name, requestKey } };
+    } catch (error) {
+      if (error &amp;&amp; error.code === 'version_conflict') {
+        return { kind: 'conflict', message: '资料已有更新，请先核对' };
+      }
+      if (error &amp;&amp; error.code === 'request_conflict') {
+        return { kind: 'request_conflict', message: '操作标识已用于其他内容，请核对' };
+      }
+      return { kind: 'uncertain', message: '结果未确认，请用同一操作重试' };
+    }
+  };
+}
+</code></pre>
+<p>返回“结果未确认”是刻意的。网络错误和错误格式的响应，都不足以证明服务端没有保存。操作键应在一次业务意图开始时产生，重试继续使用它；服务端也必须真实实现同键去重和同键异参拒绝。前端隐藏字段不是鉴权凭证，服务器仍要校验用户、权限、字段与操作作用域。</p>
+<p>业务版本冲突则需要读回最新状态，让用户合并或确认；它不属于无条件重试。也不要仅按所有 HTTP 409 返回同一个错误：版本冲突、操作键异参和其他业务拒绝，需要接口适配层提供稳定的错误类别。</p>
+<h2 id="乐观状态应随着-action-收束">乐观状态应随着 Action 收束</h2>
+<p>以下是组件里的核心连接，<code>saved</code> 是已确认记录：</p>
+<pre><code class="language-javascript">const [saved, setSaved] = useState([]);
+const [rows, addOptimistic] = useOptimistic(saved, (current, entry) =&gt;
+  current.some(row =&gt; row.requestKey === entry.requestKey)
+    ? current : current.concat({ ...entry, pending: true })
+);
+const [result, submit, pending] = useActionState(async (previous, data) =&gt; {
+  const next = await makeSaveAction(save, addOptimistic)(previous, data);
+  if (next.kind === 'saved') {
+    startTransition(() =&gt; setSaved(current =&gt;
+      current.some(row =&gt; row.id === next.receipt.id)
+        ? current : current.concat(next.receipt)
+    ));
+  }
+  return next;
+}, { kind: 'idle' });
+</code></pre>
+<p>这些语句放在函数组件内，相关函数从 React 导入；表单使用 <code>action={submit}</code>，渲染 <code>rows</code> 时把 <code>pending</code> 行显示成保存中。乐观更新发生在 Action 的上下文内，Action 结束后回到已确认的基础数据；失败时不把临时记录转成事实，成功时则用回执更新基础列表。<a href="https://react.dev/reference/react/useOptimistic" rel="noopener noreferrer">useOptimistic 的值与 Action 范围</a></p>
+<p>这里用 <code>startTransition</code> 包住 <code>await</code> 后更新另一份组件状态的步骤，避免把异步边界后的更新身份想当然。组件还需受控输入、列表渲染和错误提示；这段是连接逻辑，不是已运行的完整 UI。若回执代表的是更新既有记录，应按编号替换对应项，而不是套用本例“新建记录”的追加操作。</p>
+<h2 id="草稿保留要显式设计">草稿保留要显式设计</h2>
+<p>函数式表单 Action 成功后，React 会重置非受控字段。不能先把所有业务错误都包装成普通返回值，又未经验证地假设输入框一定保留。本文选择受控输入，将姓名放在独立的草稿状态里；只有收到确认成功或用户主动选择新建下一条时才清理草稿。<a href="https://react.dev/reference/react-dom/components/form#handle-form-submission-with-an-action-prop" rel="noopener noreferrer">表单重置行为</a></p>
+<p>提交期间可以暂时冻结字段，保证屏幕内容和提交快照一致；长表单若要继续编辑，就要另外保存“提交版本”和“新草稿”，避免旧响应覆盖新编辑。成功后新建下一条才换新操作键，失败重试则保留原键。按钮禁用只是交互保护，不能替代服务端幂等。</p>
+<p>共享按钮若使用 <code>useFormStatus</code>，必须作为目标 <code>&lt;form&gt;</code> 的后代渲染，才能读取那张表单的 pending；在创建表单的同一个外层组件里读它，不能指望它自动感知自己稍后返回的子表单。<a href="https://react.dev/reference/react-dom/hooks/useFormStatus" rel="noopener noreferrer">useFormStatus 的父表单范围</a></p>
+<h2 id="多个提交入口仍需要同一份业务协议">多个提交入口仍需要同一份业务协议</h2>
+<p>一个表单的 pending 或 Action 队列，管不到另一个标签页、另一台设备或后台任务。即使浏览器界面限制了重复点击，服务端仍要依据业务键和版本判断并发；乐观列表的去重也应使用稳定编号或请求键，不能依赖数组下标代表同一次操作。</p>
+<p>尤其要处理“结果未知以后又修改了内容”。这时复用原操作键发送另一份数据，应该得到明确的异参冲突；直接换新键再点保存，也可能在原请求已经成功时创建第二条记录。更合适的交互是先查询原请求结果，再由用户决定修改既有记录或开始新的业务意图。界面需要把这条路径说清楚，而不只是提供一个含义模糊的重试按钮。</p>
+<p>错误提示也应绑定对应的提交快照。用户已经修改姓名后，旧快照的字段错误不应继续像当前校验结果一样展示。可以在编辑时撤下过期的字段提示，同时保留尚未解决的全局冲突说明。保存中与失败状态使用清楚的文字及适当的 <code>aria-live</code> 通知；第一处可修正错误应能由键盘定位，不能只靠颜色变化解释结果。</p>
+<h2 id="验证动作契约再验证真实表单">验证动作契约，再验证真实表单</h2>
+<p>随稿 <code>examples/react19_action.mjs</code> 在 Node.js 16.16.0 执行八组行为检查，覆盖标准化成功、无效字段不调用保存、非文本载荷拒绝、空表单结构拒绝、业务版本冲突、第一次响应丢失后同键重试只接受一次、无效回执被标为未知，以及只为有效提交产生临时条目。</p>
+<p>这是注入模拟 <code>save</code> 与类 FormData 读取器的动作函数测试，没有加载 React 19 渲染器，不能证明 pending、表单自动重置或乐观状态回退已在浏览器正确运行。实际集成还要验证双击、键盘提交、慢响应、组件卸载、受控字段保留、错误焦点和重复回执去重。未接通真实后端时，也不能把模拟收据说成真实保存。</p>
+<h2 id="结论">结论</h2>
+<p>React 19 减少了描述提交过程的样板代码，但业务可靠性仍来自清楚的草稿归属、临时状态、确认回执和重试契约。把“看起来已经完成”与“已经得到服务端确认”分开，乐观交互才能既快又能恢复。</p>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2024/">2024 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/react/"># React</a><a href="/zh/blog/tags/frontend/"># Frontend</a><a href="/zh/blog/tags/api/"># API</a><a href="/zh/blog/tags/reliability/"># Reliability</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#更少的-loading-代码并不自动带来可靠保存" class="toc-level-2">更少的 loading 代码，并不自动带来可靠保存</a><a href="#先把三个层次分开" class="toc-level-2">先把三个层次分开</a><a href="#用结构化结果表达恢复路径" class="toc-level-2">用结构化结果表达恢复路径</a><a href="#乐观状态应随着-action-收束" class="toc-level-2">乐观状态应随着 Action 收束</a><a href="#草稿保留要显式设计" class="toc-level-2">草稿保留要显式设计</a><a href="#多个提交入口仍需要同一份业务协议" class="toc-level-2">多个提交入口仍需要同一份业务协议</a><a href="#验证动作契约再验证真实表单" class="toc-level-2">验证动作契约，再验证真实表单</a><a href="#结论" class="toc-level-2">结论</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="tracing-timeout-budget"><div class="post-meta"><span class="note-year">2022 · 技术回顾</span><span>6 分钟阅读</span></div><h3><a href="/zh/blog/tracing-timeout-budget/">跨服务调用为什么慢：trace、超时预算与错误关联</a></h3><p>从排队、并行调用和超时重置分析跨服务延迟，把链路上下文、剩余预算与错误分类分开设计，并用确定性模型验证截止时间不会被下游延长。</p><div class="post-bottom"><div class="tags"><span>API</span><span>OpenTelemetry</span><span>Backend</span><span>Reliability</span></div><a class="icon-link" href="/zh/blog/tracing-timeout-budget/" aria-label="阅读全文: 跨服务调用为什么慢：trace、超时预算与错误关联"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="react-effect-races"><div class="post-meta"><span class="note-year">2019 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/react-effect-races/">Hooks中的旧闭包与请求竞态：让Effect拥有清理责任</a></h3><p>通过搜索结果乱序返回分析闭包、依赖、结果归属与清理，构造可控 Promise 验证旧请求不会覆盖当前选择。</p><div class="post-bottom"><div class="tags"><span>React</span><span>JavaScript</span><span>Frontend</span><span>Concurrency</span></div><a class="icon-link" href="/zh/blog/react-effect-races/" aria-label="阅读全文: Hooks中的旧闭包与请求竞态：让Effect拥有清理责任"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>

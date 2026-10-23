@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flutter初次迁移：先定义原生边界，再移动业务流程 — Xiaofeng Qiao</title><meta name="description" content="以订单详情的渐进迁移为例，拆开导航、会话与副作用归属，给跨端消息定义可测试的协议和回退条件。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/flutter-migration-boundaries/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/flutter-migration-boundaries/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="Flutter初次迁移：先定义原生边界，再移动业务流程 — Xiaofeng Qiao"><meta property="og:description" content="以订单详情的渐进迁移为例，拆开导航、会话与副作用归属，给跨端消息定义可测试的协议和回退条件。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2018 · 技术回顾</span><span>7 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">Flutter初次迁移：先定义原生边界，再移动业务流程</h1><p class="article-deck" itemprop="description">以订单详情的渐进迁移为例，拆开导航、会话与副作用归属，给跨端消息定义可测试的协议和回退条件。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="从一个订单详情页开始为什么仍会牵动整个应用">从一个订单详情页开始，为什么仍会牵动整个应用</h2>
+<p>“先迁移一个页面”听起来是很小的任务。真正开始后，却可能发现它依赖登录会话、原生导航、图片缓存、埋点、分享、支付和通知跳转。页面数量不是迁移工作量的可靠单位，一条能进入、操作、退出并恢复的业务流程，才更接近可验收的边界。</p>
+<p>本文以虚构的订单详情流程作为渐进迁移的分析示例。回顾年份选2018，是因为Flutter 1.0在该年发布；官方当年的回顾已经提到Add to App及仍在演进的平台能力。架构分析在2026年重新整理，当前文档和Dart验证程序用于说明今天可以怎样验证这些边界。<a href="https://flutter.dev/blog/flutter-1-0-launch-wrap-up" rel="noopener noreferrer">2018年官方发布回顾</a></p>
+<p>一个合理的首批目标可以是：原生列表打开Flutter订单详情，详情读取模拟订单，用户返回原生列表；登录失效时显示明确状态，重复点击不多开页面，关闭迁移开关后还能进入原有详情。先不迁移支付、消息推送和完整登录体系，并不是忽略它们，而是让副作用继续由现有系统承担，减少第一阶段的同时变化。</p>
+<h2 id="业务所有权比目录结构更值得先讨论">业务所有权比目录结构更值得先讨论</h2>
+<p>把Dart文件放进 <code>features/orders</code> 不会自动得到清晰边界。需要先画出谁是事实来源：宿主拥有导航栈和会话生命周期；Flutter拥有详情页的加载、空、失败与展示状态；服务端仍负责订单权限与最终业务状态。订单ID可以跨边界传递，长期访问令牌、支付结果的权威判定和原生对象引用不应随意传递。</p>
+<p>另一个选择是把网络、登录和缓存也迁入Dart。新项目可能因此更一致，但对渐进迁移来说，两套会话刷新和缓存失效策略容易产生互相看不见的状态。反过来，让每一次页面内部操作都经由原生转发，也会把Flutter变成一个充满通道调用的展示壳。取舍应依据需要共享的生命周期和可独立验证的业务能力，而不是依据“跨端代码比例越高越好”。</p>
+<p>当前Flutter官方文档说明了按模块集成到已有应用的方式；今天支持的引擎管理、平台范围和集成工具，比2018更完整。它适合用来决定当前实施方案，不能直接当作历史版本安装手册。<a href="https://docs.flutter.dev/add-to-app" rel="noopener noreferrer">当前Add-to-app文档</a></p>
+<h2 id="把一次跨端调用写成一个小协议">把一次跨端调用写成一个小协议</h2>
+<p>假设宿主提供 <code>openOrder</code> 命令。与其直接发送一个字符串，可以定义版本、请求ID、会话修订号和payload。版本解决协议是否兼容，请求ID解决同一次操作是否重放，会话修订号解决退出登录之后的旧消息是否仍有效。三者不能互相替代；新请求不意味着新会话，同一会话里也有多个业务操作。</p>
+<pre><code class="language-json">{
+  &quot;version&quot;: 1,
+  &quot;requestId&quot;: &quot;r1&quot;,
+  &quot;method&quot;: &quot;openOrder&quot;,
+  &quot;sessionRevision&quot;: 7,
+  &quot;payload&quot;: {&quot;orderId&quot;: &quot;demo-42&quot;}
+}
+</code></pre>
+<p>原生端和Dart端都应校验必要字段。不能因为消息来自应用自己的Flutter模块，就默认它的参数一定正确。未知方法返回明确错误，协议版本不匹配时停止该调用；不要悄悄把未知字段或错误类型转换成可执行命令。对外部深链输入，还应单独验证来源和参数。会话修订号是本地失效机制，不是安全凭据；服务端必须继续核实当前用户是否有权访问订单。</p>
+<p>当前Platform Channel使用异步消息，并支持一组可序列化的数据类型。通道只提供传递机制，业务仍需定义错误、超时和版本约定；线程要求也要按平台API处理。<a href="https://docs.flutter.dev/platform-integration/platform-channels" rel="noopener noreferrer">当前官方通道说明</a></p>
+<h2 id="先用无引擎模型验证拒绝条件">先用无引擎模型验证拒绝条件</h2>
+<p>下面是完整的纯Dart协议模型，针对当前Dart 3.6.0执行，不是Flutter 1.0宿主代码。它没有调用原生页面，没有联网，也没有完成订单；<code>opened</code>只记录模型批准执行的次数，<code>accepted</code>只表示协议检查通过。</p>
+<pre><code class="language-dart">import 'dart:convert';
+
+// Current Dart validation model, not a Flutter 1.0 host implementation.
+class RouteGate {
+  int sessionRevision = 7;
+  final Map&lt;String, String&gt; accepted = &lt;String, String&gt;{};
+  int opened = 0;
+
+  Map&lt;String, dynamic&gt; handle(Map&lt;String, dynamic&gt; message) {
+    final dynamic version = message['version'];
+    if (version is! int || version != 1) return result('unsupported_version');
+    final dynamic id = message['requestId'];
+    final dynamic revision = message['sessionRevision'];
+    final dynamic payload = message['payload'];
+    if (id is! String || id.isEmpty || revision is! int || payload is! Map) {
+      return result('invalid_request');
+    }
+    if (message['method'] != 'openOrder') return result('unknown_method');
+    if (revision != sessionRevision) return result('stale_session');
+    final dynamic orderId = payload['orderId'];
+    if (orderId is! String || !RegExp(r'^demo-[0-9]+$').hasMatch(orderId)) {
+      return result('invalid_order_id');
+    }
+    final String key = '$revision:$id';
+    if (accepted.containsKey(key)) {
+      return result(accepted[key] == orderId ? 'duplicate' : 'id_conflict');
+    }
+    accepted[key] = orderId;
+    opened += 1;
+    return result('accepted');
+  }
+
+  void logout() {
+    sessionRevision += 1;
+    accepted.clear();
+  }
+
+  Map&lt;String, dynamic&gt; result(String status) =&gt; &lt;String, dynamic&gt;{'status': status};
+}
+
+Map&lt;String, dynamic&gt; request(String id, String order, {int revision = 7}) =&gt;
+    &lt;String, dynamic&gt;{
+      'version': 1,
+      'requestId': id,
+      'method': 'openOrder',
+      'sessionRevision': revision,
+      'payload': &lt;String, dynamic&gt;{'orderId': order},
+    };
+
+void expectStatus(RouteGate gate, Map&lt;String, dynamic&gt; message, String expected) {
+  final String actual = gate.handle(message)['status'] as String;
+  if (actual != expected) throw StateError('$actual != $expected');
+}
+
+void main() {
+  final RouteGate gate = RouteGate();
+  expectStatus(gate, request('r1', 'demo-42'), 'accepted');
+  expectStatus(gate, request('r1', 'demo-42'), 'duplicate');
+  expectStatus(gate, request('r1', 'demo-99'), 'id_conflict');
+  expectStatus(gate, request('r2', 'not-an-order'), 'invalid_order_id');
+  final Map&lt;String, dynamic&gt; wrongMethod = request('r2', 'demo-42');
+  wrongMethod['method'] = 'deleteAccount';
+  expectStatus(gate, wrongMethod, 'unknown_method');
+  final Map&lt;String, dynamic&gt; wrongVersion = request('r2', 'demo-42');
+  wrongVersion['version'] = 2;
+  expectStatus(gate, wrongVersion, 'unsupported_version');
+  final Map&lt;String, dynamic&gt; decimalVersion = request('r2', 'demo-42');
+  decimalVersion['version'] = 1.0;
+  expectStatus(gate, decimalVersion, 'unsupported_version');
+  final Map&lt;String, dynamic&gt; malformed = request('r2', 'demo-42');
+  malformed['payload'] = 'wrong shape';
+  expectStatus(gate, malformed, 'invalid_request');
+  gate.logout();
+  expectStatus(gate, request('r3', 'demo-42'), 'stale_session');
+  expectStatus(gate, request('r3', 'demo-42', revision: 8), 'accepted');
+  if (gate.opened != 2) throw StateError('unexpected side effect count');
+  print(jsonEncode(&lt;String, dynamic&gt;{
+    'passed': 10,
+    'opened': gate.opened,
+    'scope': 'pure Dart protocol model; no Flutter engine or device',
+  }));
+}
+</code></pre>
+<p>同一个请求ID携带不同订单时，返回 <code>id_conflict</code>，比一律当重复成功更安全。否则调用方复用了ID，却收到了另一个业务操作的成功回执，排查时很难知道哪个请求真正执行过。去重表在示例中仅驻留内存，并在登出时清空；生产实现还要定义保存期限、容量和多引擎是否共享。对于扣款、提交订单等服务端副作用，必须在服务端另做幂等，不能把内存表当作“恰好一次”的证明。</p>
+<p>这段程序并不负责跨线程同步。真实宿主应在约定执行上下文中串行处理导航决策，异步工作完成后重新检查会话是否仍有效。引擎重启或进程被回收后，不能依赖旧内存里保留了请求ID。</p>
+<h2 id="回退开关要放在进入流程的位置">回退开关要放在进入流程的位置</h2>
+<p>首批迁移最容易遗漏的，是成功进入Flutter后才发现无法安全退出。开关最好由宿主在进入详情流程之前决定本次使用旧页还是新页，同一次流程保持路由一致。若新旧页面随时互相抢入口，导航栈与回调会更难解释。</p>
+<p>缓存和本地数据库也需要兼容计划。只切回旧页面但旧代码读不了新写的数据，不叫完整回退。涉及数据结构变化时，先确定双读、迁移或不可逆步骤；若无法安全回滚，就应把那一步从首批迁移中移出，或把恢复方案单独评审。回退决策也不能仅依据崩溃率，登录失败、重复导航、页面空白和业务状态不一致同样可能阻断使用。</p>
+<h2 id="验收包含协议界面和宿主三层">验收包含协议、界面和宿主三层</h2>
+<p>模型可在当前Dart环境运行 <code>dart analyze flutter_boundary_contract.dart</code> 和 <code>dart run flutter_boundary_contract.dart</code>。本次静态分析无问题，十组状态断言通过，模型中的两次合法进入只产生两次计数。测试覆盖协议版本的值与整数类型、方法、payload形状、订单ID、重放冲突和退出登录后的旧消息，不依赖真实等待或网络快慢。</p>
+<p>下一层用Widget测试验证加载、失败、重试及返回状态；再以集成测试把原生入口、Flutter详情、返回宿主、前后台切换和深链唤起串起来。Flutter官方集成测试文档提供了运行到模拟器或设备的路径，本次只验证纯Dart模型，没有运行这些设备测试。<a href="https://docs.flutter.dev/testing/integration-tests" rel="noopener noreferrer">集成测试说明</a></p>
+<p>迁移完成的证据应该能回答：旧入口是否仍可用，错误是否可解释，会话失效后是否拒绝旧动作，重复触发是否产生多次副作用。把这些问题先写成协议和验收条件，再逐步迁移模块，比先追求所有页面统一使用同一个框架，更容易控制范围和交付风险。</p>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2018/">2018 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/flutter/"># Flutter</a><a href="/zh/blog/tags/dart/"># Dart</a><a href="/zh/blog/tags/architecture/"># Architecture</a><a href="/zh/blog/tags/mobile/"># Mobile</a><a href="/zh/blog/tags/api/"># API</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#从一个订单详情页开始为什么仍会牵动整个应用" class="toc-level-2">从一个订单详情页开始，为什么仍会牵动整个应用</a><a href="#业务所有权比目录结构更值得先讨论" class="toc-level-2">业务所有权比目录结构更值得先讨论</a><a href="#把一次跨端调用写成一个小协议" class="toc-level-2">把一次跨端调用写成一个小协议</a><a href="#先用无引擎模型验证拒绝条件" class="toc-level-2">先用无引擎模型验证拒绝条件</a><a href="#回退开关要放在进入流程的位置" class="toc-level-2">回退开关要放在进入流程的位置</a><a href="#验收包含协议界面和宿主三层" class="toc-level-2">验收包含协议、界面和宿主三层</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="rn-bridge-boundaries"><div class="post-meta"><span class="note-year">2016 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/rn-bridge-boundaries/">React Native混合接入：桥接协议、批量更新与原生边界</a></h3><p>回顾旧Bridge时代的混合应用，用有界采样模型解释哪些事件可以合并、何时需要背压，以及导航和会话为何应有单一所有者。</p><div class="post-bottom"><div class="tags"><span>React-Native</span><span>JavaScript</span><span>Architecture</span><span>Mobile</span></div><a class="icon-link" href="/zh/blog/rn-bridge-boundaries/" aria-label="阅读全文: React Native混合接入：桥接协议、批量更新与原生边界"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="flutter-frame-profiling"><div class="post-meta"><span class="note-year">2022 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/flutter-frame-profiling/">Flutter卡顿定位：用帧时间和对照实验替代猜测</a></h3><p>区分UI与Raster阶段，正确处理刷新率、分位数和流水线统计，再用受控实验判断优化是否真正有效。</p><div class="post-bottom"><div class="tags"><span>Flutter</span><span>Dart</span><span>Performance</span><span>Testing</span></div><a class="icon-link" href="/zh/blog/flutter-frame-profiling/" aria-label="阅读全文: Flutter卡顿定位：用帧时间和对照实验替代猜测"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>

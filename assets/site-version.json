@@ -1,10 +1,12 @@
 {
-  "release": "2026-10-23-product-lab-v4",
+  "release": "2026-10-23-engineering-journal-v5",
   "portfolio_entries": 18,
   "product_lab_cases": 10,
   "languages": [
     "zh",
     "en"
   ],
-  "execution": "Static browser scenarios using synthetic data; no server-side API is hosted by GitHub Pages."
+  "execution": "Static browser scenarios using synthetic data; no server-side API is hosted by GitHub Pages.",
+  "blog_articles": 26,
+  "technical_years": "2015–2026"
 }

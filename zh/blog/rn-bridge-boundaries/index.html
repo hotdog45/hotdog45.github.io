@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>React Native混合接入：桥接协议、批量更新与原生边界 — Xiaofeng Qiao</title><meta name="description" content="回顾旧Bridge时代的混合应用，用有界采样模型解释哪些事件可以合并、何时需要背压，以及导航和会话为何应有单一所有者。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/rn-bridge-boundaries/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/rn-bridge-boundaries/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="React Native混合接入：桥接协议、批量更新与原生边界 — Xiaofeng Qiao"><meta property="og:description" content="回顾旧Bridge时代的混合应用，用有界采样模型解释哪些事件可以合并、何时需要背压，以及导航和会话为何应有单一所有者。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2016 · 技术回顾</span><span>7 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">React Native混合接入：桥接协议、批量更新与原生边界</h1><p class="article-deck" itemprop="description">回顾旧Bridge时代的混合应用，用有界采样模型解释哪些事件可以合并、何时需要背压，以及导航和会话为何应有单一所有者。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="共用一套界面之前先共用一套约定">共用一套界面之前，先共用一套约定</h2>
+<p>在已有iOS和Android应用里接入RN，难点往往不是把一个组件显示出来，而是让它服从现有导航、会话和发布流程。JS希望打开页面，原生发现登录已过期；JS还在处理一串滚动事件，原生页面已经退出。跨端界面可以共用实现，并不代表两侧可以各自维护一份不受约束的真实状态。</p>
+<p>本文在2026年回顾2016年的混合接入问题，讨论旧Bridge的异步与序列化边界，不把JSI、TurboModules或新架构写成当年能力。RN在2015年发布Android支持，2016年官方活动回顾已经专门讨论既有代码库、原生导航所有权和跨平台API的取舍。<a href="https://reactnative.dev/blog/2015/09/14/react-native-for-android" rel="noopener noreferrer">Android发布记录</a> <a href="https://reactnative.dev/blog/2016/08/12/react-native-meetup-san-francisco" rel="noopener noreferrer">2016年官方回顾</a></p>
+<p>可以把首个模块限定为“原生商品列表进入RN筛选页，返回筛选条件，再由原生刷新列表”。原生拥有导航与登录状态，RN拥有筛选交互的临时状态。两侧交换条件，而不是互相持有对方的页面对象或任意执行代码。这样出现问题时，能明确判断是入口、消息还是业务状态出了差异。</p>
+<h2 id="一次跨边界调用不是一次本地函数调用">一次跨边界调用不是一次本地函数调用</h2>
+<p>旧架构通过异步Bridge在JS和原生之间传递序列化调用。今天官方的新架构介绍回顾了这一路径及高频、大对象通信带来的约束；这份后来的说明适合解释机制，不代表它描述的新功能在2016年已经存在。<a href="https://reactnative.dev/blog/2024/10/23/the-new-architecture-is-here" rel="noopener noreferrer">官方架构回顾</a></p>
+<p>设计API时，调用方不能假定拿到原生返回值后，所有依赖的界面变化已经显示；也不能把跨边界对象当成两侧共享的可变内存。发送的数据越宽，参数版本和兼容性越难管理。传一个业务ID和必要上下文，通常比传完整对象图更容易检查，但原生或服务端仍要验证ID是否属于当前用户。</p>
+<p>平台差异也不一定要全部隐藏。两个平台的选择器、权限提示和返回键语义可能不同。一个包含几十个可选参数的“统一API”，有时只是把差异推迟到了运行时。可以共享业务请求与结果模型，同时为确实不同的交互保留平台适配层。边界越小，双端实现越容易采用同一组契约用例。</p>
+<h2 id="合并的是可替换状态不是业务命令">合并的是可替换状态，不是业务命令</h2>
+<p>滚动位置、拖动预览等高频采样，通常只需要最新值；提交订单、删除草稿或审计事件却不能随便丢掉中间操作。首先判断一条消息表达的是“当前是什么”，还是“必须发生一次什么”。把两者放进同一条无界事件队列，容易同时产生延迟和难以解释的丢事件。</p>
+<p>下面的完整Node程序只模拟可替换UI采样：同一view的待发送值合并为最新值，最多保留两个view，每次只允许一批未确认消息。确认携带页面修订号和序号，页面重置后旧确认失效。这里的上限是演示参数，不是RN Bridge的固定容量。</p>
+<pre><code class="language-javascript">'use strict';
+var assert = require('assert');
+
+// A transport model for replaceable UI samples, not RN bridge implementation.
+function Sampler(send, maxItems) {
+  this.send = send;
+  this.maxItems = maxItems;
+  this.pending = Object.create(null);
+  this.revision = 1;
+  this.sequence = 0;
+  this.inFlight = 0;
+}
+Sampler.prototype.sample = function (viewId, value) {
+  if (typeof viewId !== 'string' || viewId.length === 0 || viewId.length &gt; 64 ||
+      !Number.isFinite(value)) return false;
+  if (!Object.prototype.hasOwnProperty.call(this.pending, viewId) &amp;&amp;
+      Object.keys(this.pending).length &gt;= this.maxItems) return false;
+  this.pending[viewId] = value;
+  return true;
+};
+Sampler.prototype.flush = function () {
+  if (this.inFlight || !Object.keys(this.pending).length) return null;
+  var events = this.pending;
+  this.pending = Object.create(null);
+  var message = { revision: this.revision, sequence: ++this.sequence, events: events };
+  this.inFlight = message.sequence;
+  this.send(JSON.parse(JSON.stringify(message)));
+  return message;
+};
+Sampler.prototype.ack = function (revision, sequence) {
+  if (revision !== this.revision || sequence !== this.inFlight) return false;
+  this.inFlight = 0;
+  return true;
+};
+Sampler.prototype.reset = function () {
+  this.revision += 1;
+  this.pending = Object.create(null);
+  this.inFlight = 0;
+};
+
+var sent = [];
+var sampler = new Sampler(function (message) { sent.push(message); }, 2);
+for (var i = 0; i &lt; 100; i += 1) sampler.sample('list-A', i);
+var first = sampler.flush();
+assert.strictEqual(sent.length, 1);
+assert.strictEqual(sent[0].events['list-A'], 99);
+sampler.sample('list-A', 101);
+assert.strictEqual(sampler.flush(), null);
+assert.strictEqual(sampler.ack(first.revision, first.sequence + 1), false);
+assert.strictEqual(sampler.ack(first.revision, first.sequence), true);
+var second = sampler.flush();
+assert.strictEqual(second.events['list-A'], 101);
+sampler.reset();
+assert.strictEqual(sampler.ack(second.revision, second.sequence), false);
+assert.strictEqual(sampler.sample('a', 1), true);
+assert.strictEqual(sampler.sample('b', 2), true);
+assert.strictEqual(sampler.sample('c', 3), false);
+assert.strictEqual(sampler.sample('a', NaN), false);
+assert.strictEqual(sampler.sample('', 1), false);
+assert.strictEqual(sampler.sample(new Array(66).join('a'), 1), false);
+console.log('PASS: 13 batching/backpressure/revision assertions; synthetic transport only');
+</code></pre>
+<p>合并发生在发送之前，而不是在原生已经执行操作后再假装它没发生。<code>JSON.stringify</code>与反序列化在这里用于让测试中的发送端和接收端没有共享对象引用，并不声称复刻RN内部完整传输格式。代码在Node 16.16.0执行，验证的是消息契约模型，没有启动RN运行时。</p>
+<p>容量还要考虑单条内容，而不仅是条数。示例只接受有限数值，并把view标识限制为64个字符；若实际接口允许传图片Base64、完整列表或任意字符串，即使一批只有两项也可能很重。此时应另设字节预算、分片协议或改传本地资源标识。调试日志也不应把大payload再完整复制一遍，否则观察消息的成本可能掩盖原来的瓶颈。</p>
+<h2 id="背压需要结束条件也需要失败策略">背压需要结束条件，也需要失败策略</h2>
+<p>模型中没有收到确认就不会继续发送，因此待确认批次不能无限累积。但生产系统还要决定确认丢失、页面销毁和原生异常时怎么办。对于可替换采样，可以在超时后结束该修订，重新同步一份完整当前状态；不能直接把这一策略用于支付或订单命令，否则重发会引入重复副作用。</p>
+<p>另一个容易忽略的地方是事件监听。进入页面注册监听，退出页面却没有对应移除，即使业务对象没有明显引用环，也可能收到重复事件。会话失效时原生应能接管流程，JS也要拒绝旧页面的后续状态提交。仅传一个页面名称不够，同名页面可以多次进入，修订号或独立实例ID才有助于区分。</p>
+<p>队列有界不代表体验一定顺畅。合并到最后一个位置，会改变中间动画的观察效果；如果交互本身需要每个采样点，例如轨迹绘制，就必须采用不同的采样、压缩或原生处理方案。判断是否允许合并，应来自业务语义和视觉验收，而不是先决定“所有消息都节流100毫秒”。</p>
+<h2 id="用兼容矩阵检查混合发布">用兼容矩阵检查混合发布</h2>
+<p>混合应用还有两份变更需要一起审查：原生宿主版本与JS bundle版本。新增一个原生方法后，旧宿主可能尚未具备它；更新JS代码却只在最新原生包上测试，会把这个问题留给仍运行旧版本的用户。应显式记录方法版本和能力探测，在缺少能力时走可理解的旧流程，而不是吞掉异常显示成功。</p>
+<p>本例用 <code>node --check rn_bridge_boundaries.js</code> 检查语法，再运行脚本。十三组断言覆盖最新值合并、待确认时不继续发送、错误确认、正确确认、旧页面确认、队列容量、标识长度和非有限数拒绝。测试中一百次采样合成一批，这是输入fixture的结果，不能据此宣传真实应用性能提升百分比。</p>
+<p>测试之外可以记录每条业务流程的发送批次、payload字节数、等待确认时间与丢弃原因，但不要把这些日志直接当成用户可见延迟。一次操作还可能等待JS计算、原生布局、网络或渲染；应关联同一流程的时间点，再决定是否值得调整边界。</p>
+<p>真实集成验收应分别覆盖iOS和Android，在两种宿主版本下检查进入退出、登录过期、快速重复进入和后台返回。再用真实设备分析JS、原生主线程与通信负载，确定卡顿在哪一侧。迁移的价值不是跨边界调用次数看起来少了，而是每条消息都有清楚的含义、容量和生命周期，两个平台也能对相同失败给出一致的业务结果。</p>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2016/">2016 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/react-native/"># React-Native</a><a href="/zh/blog/tags/javascript/"># JavaScript</a><a href="/zh/blog/tags/architecture/"># Architecture</a><a href="/zh/blog/tags/mobile/"># Mobile</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#共用一套界面之前先共用一套约定" class="toc-level-2">共用一套界面之前，先共用一套约定</a><a href="#一次跨边界调用不是一次本地函数调用" class="toc-level-2">一次跨边界调用不是一次本地函数调用</a><a href="#合并的是可替换状态不是业务命令" class="toc-level-2">合并的是可替换状态，不是业务命令</a><a href="#背压需要结束条件也需要失败策略" class="toc-level-2">背压需要结束条件，也需要失败策略</a><a href="#用兼容矩阵检查混合发布" class="toc-level-2">用兼容矩阵检查混合发布</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="flutter-migration-boundaries"><div class="post-meta"><span class="note-year">2018 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/flutter-migration-boundaries/">Flutter初次迁移：先定义原生边界，再移动业务流程</a></h3><p>以订单详情的渐进迁移为例，拆开导航、会话与副作用归属，给跨端消息定义可测试的协议和回退条件。</p><div class="post-bottom"><div class="tags"><span>Flutter</span><span>Dart</span><span>Architecture</span><span>Mobile</span><span>API</span></div><a class="icon-link" href="/zh/blog/flutter-migration-boundaries/" aria-label="阅读全文: Flutter初次迁移：先定义原生边界，再移动业务流程"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="rn-new-architecture-migration"><div class="post-meta"><span class="note-year">2024 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/rn-new-architecture-migration/">React Native新架构迁移：兼容层、原生模块与回归矩阵</a></h3><p>以RN0.76为历史锚点，拆开运行时升级、原生依赖迁移和业务验收，用显式证据门槛避免把能编译误当成迁移完成。</p><div class="post-bottom"><div class="tags"><span>React-Native</span><span>Architecture</span><span>Testing</span><span>Native-Modules</span></div><a class="icon-link" href="/zh/blog/rn-new-architecture-migration/" aria-label="阅读全文: React Native新架构迁移：兼容层、原生模块与回归矩阵"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>

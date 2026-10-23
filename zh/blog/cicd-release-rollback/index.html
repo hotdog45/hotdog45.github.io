@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CI/CD可回退发布：构建产物、配置校验与验收门槛 — Xiaofeng Qiao</title><meta name="description" content="围绕同一份不可变产物建立验证链，区分构建成功、发布切换、业务验收和可安全回退的范围。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/cicd-release-rollback/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/cicd-release-rollback/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="CI/CD可回退发布：构建产物、配置校验与验收门槛 — Xiaofeng Qiao"><meta property="og:description" content="围绕同一份不可变产物建立验证链，区分构建成功、发布切换、业务验收和可安全回退的范围。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2021 · 技术回顾</span><span>6 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">CI/CD可回退发布：构建产物、配置校验与验收门槛</h1><p class="article-deck" itemprop="description">围绕同一份不可变产物建立验证链，区分构建成功、发布切换、业务验收和可安全回退的范围。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="流水线全绿为什么还不能叫发布成功">流水线全绿，为什么还不能叫发布成功</h2>
+<p>一次静态站点发布可以经历这些步骤：编译成功、压缩包上传成功、服务器目录切换成功。用户仍可能打开空白页，因为资源路径错误，或配置引用了不存在的 API。</p>
+<p>流水线的每一步都可能正确完成自己负责的动作，却没有覆盖用户真正需要的结果。本文以 2021 年的持续交付问题为回顾视角，使用 2026 年编写的本地发布模型，讨论如何把构建、部署和验收连接起来。示例只操作临时目录，没有访问服务器或更改任何在线服务。</p>
+<h2 id="每个环境都重新构建会破坏证据链">每个环境都重新构建，会破坏证据链</h2>
+<p>如果测试环境和生产环境分别安装依赖、分别构建，即使提交号相同，最终文件也可能不同。依赖源变化、未锁定版本、构建时变量或工具链差异，都能改变产物。</p>
+<p>更清楚的流程是构建一次，保存产物清单、提交标识、工具链和内容摘要，随后提升同一份产物。配置如果必须随环境变化，应作为明确的独立输入管理，并在上线前校验必需字段及允许值。不要把数据库密码或生产密钥写进浏览器可下载的构建产物。</p>
+<p>哈希可以检查产物是否与先前记录一致，但不能证明它本身可信。如果攻击者能同时修改文件和旁边的哈希文件，两者仍会匹配。真实流水线还需要可信的构建来源、受保护的产物存储及适当的签名或证明机制；示例只检验完整性，不宣称实现供应链认证。</p>
+<h2 id="将发布拆成准备切换和确认">将发布拆成准备、切换和确认</h2>
+<p>一个可审查的发布过程可以有三个阶段：</p>
+<ol>
+<li>准备版本目录，核对产物和配置，不触碰当前版本。</li>
+<li>在串行发布边界内切换 current 指针，记录上一个目标。</li>
+<li>检查新版本的入口、关键资源和最小业务路径，失败则恢复指针。</li>
+</ol>
+<p>对于 POSIX 上的静态文件模型，示例创建一个临时符号链接，再用同目录的替换操作切换 current：</p>
+<pre><code class="language-python">temporary = root / (&quot;.next-&quot; + uuid.uuid4().hex)
+temporary.symlink_to(&quot;releases/&quot; + version)
+os.replace(str(temporary), str(root / &quot;current&quot;))
+</code></pre>
+<p>Python 对 <code>os.replace</code> 的约定包含同文件系统上的替换行为；跨文件系统操作可能失败。这个局部原子性不等于所有客户端同时切换，也不意味着断电后状态一定符合预期。已经打开文件的请求、CDN 缓存以及多个实例仍需要分别考虑。<a href="https://docs.python.org/3.9/library/os.html#os.replace" rel="noopener noreferrer">os.replace 文档</a></p>
+<h2 id="发布锁和版本检查解决不同的冲突">发布锁和版本检查解决不同的冲突</h2>
+<p>两个任务同时发布时，只把 symlink 替换做成原子操作仍然不够。较早的任务可能在较晚任务成功后执行“回退”，覆盖新的正确状态。</p>
+<p>示例用 POSIX 文件锁包住切换和冒烟检查，要求所有发布者遵守同一锁协议；同时校验调用者认知中的 previous 与实际目标一致。锁限制同时执行，previous 检查拒绝基于过期状态的意图。</p>
+<pre><code class="language-python">previous = os.readlink(str(current)) if current.is_symlink() else None
+if previous != expected_previous:
+    raise RuntimeError(&quot;stale deployment intent&quot;)
+replace_pointer(root, &quot;releases/&quot; + version)
+try:
+    if not smoke(current):
+        raise RuntimeError(&quot;smoke check failed&quot;)
+except BaseException:
+    replace_pointer(root, previous)
+    raise
+</code></pre>
+<p>片段省略了首次发布无 previous 的分支；完整程序在这种情况下移除本次失败的指针。生产脚本还要限制冒烟检查时间、确认回退动作本身成功，并保护版本目录不被其他进程修改。文件锁是协作约定，不会阻止一个不遵守锁的外部部署器。</p>
+<h2 id="冒烟检查应该跨过最关键的边界">冒烟检查应该跨过最关键的边界</h2>
+<p>只检查首页返回 200，可能无法发现 JavaScript 和样式路径错误。静态站点至少应该读取一个入口页面和它引用的关键资源；带后端的应用则需要验证 API 契约及必要依赖。</p>
+<p>但冒烟检查也不应该随意制造真实订单或发送消息。可以使用明确隔离的测试主体，或只读、可恢复的验证路径。检查要有可重复输入、清楚的成功标准和清理方式，不能把一个有副作用的“健康检查”高频运行在真实客户数据上。</p>
+<p>版本切换后还应回读当前版本标识，避免检查请求命中了缓存或旧实例。多实例发布需要考虑混合版本窗口：新旧 API、资源和数据库结构必须在过渡期相互兼容，或者采用明确的流量隔离方式。</p>
+<h2 id="应用回退不等于数据回退">应用回退不等于数据回退</h2>
+<p>恢复旧二进制或静态目录通常比较直接，撤销数据库结构和已经发生的外部动作则复杂得多。若新版先删除了旧字段，再试图恢复旧应用，回退可能根本无法工作。</p>
+<p>较稳妥的迁移常先扩展兼容结构，再逐步转换读写，最后在验证完成后收缩旧结构。每一阶段都要写清楚哪些版本能同时运行。需要回滚数据时，应有单独验证过的备份、恢复和一致性方案，不能把删除迁移脚本视为简单的 inverse 操作。</p>
+<p>这也影响发布门槛：不可逆的数据操作，应在执行前有明确审批和恢复判断，而不是等冒烟失败后才发现“没有上一个状态可以恢复”。</p>
+<h2 id="ci权限不能为了方便而默认放大">CI权限不能为了方便而默认放大</h2>
+<p>部署需要的凭据与读取源代码需要的权限不同。可以把构建与部署拆成不同任务，用部署环境限制分支、审批及秘密访问；不可信来源的构建结果也不能直接获得生产权限。<a href="https://docs.github.com/en/actions/concepts/workflows-and-actions/deployment-environments" rel="noopener noreferrer">GitHub 部署环境</a></p>
+<p>当前部署方案可以研究 OIDC 短期凭据，但云端仍须校验仓库、分支或环境等信任条件，不能因为令牌寿命短就接受所有来源。这里引用的是现行加固文档，不是声称 2021 年的系统已经采用全部当前设置。<a href="https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-cloud-providers" rel="noopener noreferrer">GitHub OIDC 指南</a></p>
+<h2 id="验证记录要能指出没有测什么">验证记录要能指出没有测什么</h2>
+<p>配套 Python 3.9.6 模型在 macOS 临时目录中通过五项测试：成功切换到准确产物、冒烟失败恢复旧版本、产物被修改时拒绝激活、过期发布意图被拒绝、既有版本目录不被覆盖。</p>
+<pre><code class="language-bash">python3 -m unittest -v
+</code></pre>
+<p>它没有验证远程上传、真实反向代理、多实例流量、断电持久性或数据库恢复，也没有执行 GitHub Actions。实际上线需要补齐这些目标环境检查。一个有价值的交付记录，应该同时包含已通过的范围和仍需验证的边界。</p>
+<h2 id="参考与配套">参考与配套</h2>
+<ul>
+<li><a href="https://docs.python.org/3.9/library/os.html#os.replace" rel="noopener noreferrer">Python os.replace</a>：本地指针替换使用的系统接口。</li>
+<li><a href="https://docs.github.com/en/actions/concepts/workflows-and-actions/deployment-environments" rel="noopener noreferrer">GitHub Deployment environments</a>：部署环境及保护规则。</li>
+<li><a href="https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-cloud-providers" rel="noopener noreferrer">GitHub OIDC</a>：现行短期凭据与信任条件。</li>
+<li><code>examples/release-rollback/</code> 含完整本地模型和五项测试。目录名里的 release 只是模拟发布，不代表实际公网部署。</li>
+</ul>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2021/">2021 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/cicd/"># CICD</a><a href="/zh/blog/tags/deployment/"># Deployment</a><a href="/zh/blog/tags/testing/"># Testing</a><a href="/zh/blog/tags/python/"># Python</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#流水线全绿为什么还不能叫发布成功" class="toc-level-2">流水线全绿，为什么还不能叫发布成功</a><a href="#每个环境都重新构建会破坏证据链" class="toc-level-2">每个环境都重新构建，会破坏证据链</a><a href="#将发布拆成准备切换和确认" class="toc-level-2">将发布拆成准备、切换和确认</a><a href="#发布锁和版本检查解决不同的冲突" class="toc-level-2">发布锁和版本检查解决不同的冲突</a><a href="#冒烟检查应该跨过最关键的边界" class="toc-level-2">冒烟检查应该跨过最关键的边界</a><a href="#应用回退不等于数据回退" class="toc-level-2">应用回退不等于数据回退</a><a href="#ci权限不能为了方便而默认放大" class="toc-level-2">CI权限不能为了方便而默认放大</a><a href="#验证记录要能指出没有测什么" class="toc-level-2">验证记录要能指出没有测什么</a><a href="#参考与配套" class="toc-level-2">参考与配套</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="python-replayable-automation"><div class="post-meta"><span class="note-year">2021 · 技术回顾</span><span>6 分钟阅读</span></div><h3><a href="/zh/blog/python-replayable-automation/">可重跑的Python自动化：断点、去重与失败账本</a></h3><p>让批处理绑定输入快照，以稳定工作键恢复进度，隔离坏行并对账每个终态，而不是靠行号继续跑。</p><div class="post-bottom"><div class="tags"><span>Python</span><span>Automation</span><span>SQLite</span><span>Testing</span></div><a class="icon-link" href="/zh/blog/python-replayable-automation/" aria-label="阅读全文: 可重跑的Python自动化：断点、去重与失败账本"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="flutter-frame-profiling"><div class="post-meta"><span class="note-year">2022 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/flutter-frame-profiling/">Flutter卡顿定位：用帧时间和对照实验替代猜测</a></h3><p>区分UI与Raster阶段，正确处理刷新率、分位数和流水线统计，再用受控实验判断优化是否真正有效。</p><div class="post-bottom"><div class="tags"><span>Flutter</span><span>Dart</span><span>Performance</span><span>Testing</span></div><a class="icon-link" href="/zh/blog/flutter-frame-profiling/" aria-label="阅读全文: Flutter卡顿定位：用帧时间和对照实验替代猜测"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>

@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iOS异步回调与对象生命周期：从引用环到取消边界 — Xiaofeng Qiao</title><meta name="description" content="把对象是否存活、请求是否有效和界面是否仍需要结果拆开处理，用可复现的Objective-C程序验证晚到回调。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/ios-callback-lifetime/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/ios-callback-lifetime/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="iOS异步回调与对象生命周期：从引用环到取消边界 — Xiaofeng Qiao"><meta property="og:description" content="把对象是否存活、请求是否有效和界面是否仍需要结果拆开处理，用可复现的Objective-C程序验证晚到回调。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2015 · 技术回顾</span><span>8 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">iOS异步回调与对象生命周期：从引用环到取消边界</h1><p class="article-deck" itemprop="description">把对象是否存活、请求是否有效和界面是否仍需要结果拆开处理，用可复现的Objective-C程序验证晚到回调。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="页面已经离开请求为什么还在影响界面">页面已经离开，请求为什么还在影响界面</h2>
+<p>列表搜索是一个很小的功能，却把异步代码的三个问题放在同一处：页面退出后能否释放，旧请求返回后能否覆盖新结果，用户点击取消后还有没有代码继续运行。只在回调里添加一行 <code>weakSelf</code>，通常只能回答第一个问题。</p>
+<p>这篇文章以2015年前后的Objective-C、ARC与Block写法为回顾对象，在2026年重新梳理现在仍常见的生命周期边界。验证使用当前macOS上的Foundation和Clang，不包含UIKit或设备网络栈；代码采用ARC和Block这一时期已有的表达方式。</p>
+<p>先把目标写成可观察的规则：页面所有者释放后不能因回调被强行留住；只接受当前请求的结果；取消会使当前结果失效；请求成功、失败、取消最终都必须有清理路径。最后一条不是“立即释放所有资源”的保证，而是需要代码明确说明谁负责收尾。</p>
+<h2 id="引用关系和业务有效性是两张不同的图">引用关系和业务有效性是两张不同的图</h2>
+<p>考虑 <code>页面 → 请求对象 → completion Block → 页面</code>。前三段都是强引用，最后一段若捕获 <code>self</code>，就可能形成引用环。Apple的Objective-C文档解释了Block捕获对象的强引用，以及弱引用打断这一关系的方式。<a href="https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/ProgrammingWithObjectiveC/WorkingwithBlocks/WorkingwithBlocks.html" rel="noopener noreferrer">官方Block说明</a></p>
+<p>但是，弱引用回答的是“对象还在吗”，不是“这条结果还有资格修改它吗”。用户先搜A再搜B，页面始终活着；A晚于B返回时，弱引用不会阻止A覆盖B。另一个场景是用户取消操作后仍留在页面，弱引用同样非空。</p>
+<p>因此需要两个独立条件：回调执行期间取得一个临时强引用，确保这一段使用过程中对象不消失；再比较请求代次，确认结果仍属于当前意图。临时强引用只在回调执行期间存在，和长期把所有者捕获进Block不同。若数据本来由应用级仓库负责完成，生命周期也不必绑定页面；这时应由仓库接收结果，页面仅订阅自己的可见状态，不能机械地把所有回调都改成弱引用。</p>
+<h2 id="先约束线程再引入代次">先约束线程，再引入代次</h2>
+<p>下面的最小程序把所有方法调用和结果接收限制在同一串行执行上下文。真实UIKit接入可以把这些状态操作统一放到主线程，但不应把耗时解析也塞进主线程。若服务库在任意队列回调，先切到约定队列，再读取或修改代次；单纯把属性声明成 <code>atomic</code>，不能让“比较代次并写入结果”变成一个原子业务操作。</p>
+<p><code>FakeTask</code>故意允许取消之后仍递交完成结果，用来测试最不利的时序。它不是对NSURLSession或所有第三方SDK的精确模拟。具体API是否回调、在哪个队列回调，要查各自契约。Apple对Operation的取消也要求任务实现配合处理，不能把取消请求理解成任意执行中的工作已被强行终止。<a href="https://developer.apple.com/library/archive/documentation/General/Conceptual/ConcurrencyProgrammingGuide/OperationObjects/OperationObjects.html" rel="noopener noreferrer">Operation文档</a></p>
+<pre><code class="language-objective-c">#import &lt;Foundation/Foundation.h&gt;
+
+@interface FakeTask : NSObject
+@property(nonatomic, copy) void (^completion)(NSString *);
+@property(nonatomic) BOOL cancelled;
+@property(nonatomic) BOOL completesOnCancel;
+- (void)cancel;
+- (void)deliver:(NSString *)value;
+@end
+
+@implementation FakeTask
+- (void)cancel {
+    self.cancelled = YES;
+    if (self.completesOnCancel) [self deliver:@&quot;cancel-synchronously&quot;];
+}
+- (void)deliver:(NSString *)value {
+    // Deliberately allow a late completion after cancel in this test double.
+    void (^completion)(NSString *) = self.completion;
+    self.completion = nil;
+    if (completion) completion(value);
+}
+@end
+
+@interface RequestOwner : NSObject
+@property(nonatomic, strong) FakeTask *task;
+@property(nonatomic, copy) NSString *value;
+@property(nonatomic) NSUInteger generation;
+@property(nonatomic) NSUInteger updates;
+- (FakeTask *)start;
+- (void)cancelCurrent;
+@end
+
+@implementation RequestOwner
+- (FakeTask *)start {
+    NSUInteger ticket = ++self.generation;
+    [self.task cancel];
+    FakeTask *task = [FakeTask new];
+    self.task = task;
+    __weak RequestOwner *weakSelf = self;
+    task.completion = ^(NSString *value) {
+        RequestOwner *owner = weakSelf;
+        if (!owner || ticket != owner.generation) return;
+        owner.task = nil;
+        owner.value = value;
+        owner.updates += 1;
+    };
+    return task;
+}
+- (void)cancelCurrent {
+    self.generation += 1;
+    [self.task cancel];
+    self.task = nil;
+}
+@end
+
+static void check(BOOL condition, const char *message) {
+    if (!condition) {
+        fprintf(stderr, &quot;FAIL: %s\n&quot;, message);
+        exit(1);
+    }
+}
+
+int main(void) {
+    @autoreleasepool {
+        RequestOwner *owner = [RequestOwner new];
+        FakeTask *old = [owner start];
+        FakeTask *current = [owner start];
+        [old deliver:@&quot;stale&quot;];
+        check(owner.updates == 0, &quot;old result ignored&quot;);
+        [current deliver:@&quot;new&quot;];
+        check([owner.value isEqualToString:@&quot;new&quot;], &quot;current result accepted&quot;);
+        check(owner.updates == 1, &quot;one accepted update&quot;);
+
+        FakeTask *cancelled = [owner start];
+        [owner cancelCurrent];
+        [cancelled deliver:@&quot;late&quot;];
+        check(owner.updates == 1, &quot;cancelled result ignored&quot;);
+
+        FakeTask *syncOld = [owner start];
+        syncOld.completesOnCancel = YES;
+        FakeTask *replacement = [owner start];
+        check(syncOld.completion == nil, &quot;cancel synchronously delivered completion&quot;);
+        check(owner.updates == 1, &quot;synchronous cancel cannot update old result&quot;);
+        check(owner.task == replacement, &quot;replacement task remains current&quot;);
+        [replacement deliver:@&quot;replacement&quot;];
+        check(owner.updates == 2, &quot;replacement result still accepted&quot;);
+
+        __weak RequestOwner *weakOwner = owner;
+        FakeTask *retainedByTransport = [owner start];
+        owner = nil;
+        check(weakOwner == nil, &quot;callback does not retain owner&quot;);
+        [retainedByTransport deliver:@&quot;after release&quot;];
+        check(retainedByTransport.completion == nil, &quot;completion released&quot;);
+        puts(&quot;PASS: stale, current, cancelled, synchronous-cancel, released-owner, completion-release&quot;);
+    }
+    return 0;
+}
+</code></pre>
+<p>这里的关键不是代次变量的名字，而是失效发生的时机。开始新请求时，先增加代次使旧ticket失效，再调用旧任务的 <code>cancel</code>；用户取消时也采用这个顺序。适配器的取消方法可能在当前串行上下文中同步触发完成回调，仅仅约束线程并不能阻止这种重入。先失效后取消，才能同时拒绝同步回调和延迟回调；若取消之后才更新代次，旧结果仍有一个被接受的窗口。</p>
+<p>示例在递交结果前清空一次性completion，既避免重复调用，也释放Block捕获的其他对象。生产代码若允许流式多次回调，则不能照搬这一点，应单独定义结束事件、订阅取消与最后一次释放。一次性请求和长连接订阅的资源模型不同。</p>
+<p>清理本身也要通过同一个有效性检查。旧回调如果不比较代次就执行 <code>owner.task = nil</code>，可能把页面正在持有的新任务清掉。成功和失败可以展示不同状态，但都只能结束属于自己的当前任务；取消后的错误回调不应又把界面从“已停止”改成“请求失败”。这些约束应和业务状态机一起审查，而不是散落在几个异常处理分支中。</p>
+<h2 id="取消不能代替清理清理也不能篡改结果">取消不能代替清理，清理也不能篡改结果</h2>
+<p>一种常见修补是在 <code>dealloc</code> 中取消请求。它可以作为最后一道防线，但如果引用环已经让对象无法进入 <code>dealloc</code>，这一修补不会执行。取消应放在业务生命周期结束的位置，例如搜索条件改变、页面不再拥有任务或用户明确停止；是否在页面消失时取消，要看任务是否还应在后台完成，不能统一套用。</p>
+<p>还要区分“停止展示结果”和“撤销服务端操作”。客户端丢弃一个上传完成回调，不代表文件没有上传；取消一个支付或订单请求，更不代表服务端事务已回滚。对于有副作用的接口，应另外设计幂等键、结果查询和状态对账。UI代次只解决本地结果归属，不能承担远端一致性。</p>
+<p>如果有多个合法并行任务，一个全局代次会过度失效。例如头像请求不该让订单列表请求失效。这时按资源或业务槽位维护token，也可以用不可变请求ID。选择整数代次是为了让本文的单槽位问题可读，不是所有并发协调器的最终设计。</p>
+<h2 id="验证要覆盖还活着但已经不需要">验证要覆盖“还活着但已经不需要”</h2>
+<p>只测试对象释放不够。上面的程序没有睡眠和真实网络，手动控制递交顺序，使竞态可以稳定复现：先递交旧请求，再递交当前请求；取消后递交；设置旧任务在取消时立即回调，再开始替代请求；外部仍持有任务时释放所有者，最后再递交。同步取消用例同时确认旧任务确实回调过、写入次数未增加、替代任务仍是当前任务且能够正常完成，避免错误代码悄悄多写一次却恰好留下正确的最终文本。</p>
+<p>在安装Apple命令行工具的macOS上，把代码保存为 <code>ios_callback_lifetime.m</code>，运行：</p>
+<pre><code class="language-bash">clang -fobjc-arc -fblocks -Wall -Wextra -Werror \
+  -framework Foundation ios_callback_lifetime.m -o ios_callback_lifetime
+./ios_callback_lifetime
+</code></pre>
+<p>本次以Apple Clang 21.0.0运行，六组生命周期场景检查通过，包含取消同步重入。它验证了引用和代次模型，不证明UIKit页面、实际网络取消或第三方SDK线程约定全部正确。接入真实应用后，还需用Memory Graph/Instruments观察循环与持续分配，反复进出页面，并在网络限速、连续输入和应用切后台时检查UI。工具显示某次对象已释放，也不代表每条异常路径都完成清理。</p>
+<h2 id="留下三条可以审查的约定">留下三条可以审查的约定</h2>
+<p>异步回调的可靠性，可以从三条具体约定开始：谁拥有任务，哪个串行上下文修改状态，什么事件使结果失效。引用关系决定对象能否结束，代次或请求ID决定结果能否生效，底层API契约决定取消与收尾如何发生。把这三件事分别写清，再决定用Block、delegate还是其他异步抽象，代码审查才有可核对的依据。</p>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2015/">2015 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/ios/"># iOS</a><a href="/zh/blog/tags/objective-c/"># Objective-C</a><a href="/zh/blog/tags/memory/"># Memory</a><a href="/zh/blog/tags/concurrency/"># Concurrency</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#页面已经离开请求为什么还在影响界面" class="toc-level-2">页面已经离开，请求为什么还在影响界面</a><a href="#引用关系和业务有效性是两张不同的图" class="toc-level-2">引用关系和业务有效性是两张不同的图</a><a href="#先约束线程再引入代次" class="toc-level-2">先约束线程，再引入代次</a><a href="#取消不能代替清理清理也不能篡改结果" class="toc-level-2">取消不能代替清理，清理也不能篡改结果</a><a href="#验证要覆盖还活着但已经不需要" class="toc-level-2">验证要覆盖“还活着但已经不需要”</a><a href="#留下三条可以审查的约定" class="toc-level-2">留下三条可以审查的约定</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="java-future-pools"><div class="post-meta"><span class="note-year">2017 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/java-future-pools/">Java异步任务：CompletableFuture、线程池与超时传播</a></h3><p>从一个有界线程池出发，说明异步组合、队列饱和、等待超时和底层工作取消为什么是四个不同问题。</p><div class="post-bottom"><div class="tags"><span>Java</span><span>Concurrency</span><span>Backend</span><span>Testing</span></div><a class="icon-link" href="/zh/blog/java-future-pools/" aria-label="阅读全文: Java异步任务：CompletableFuture、线程池与超时传播"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="react-effect-races"><div class="post-meta"><span class="note-year">2019 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/react-effect-races/">Hooks中的旧闭包与请求竞态：让Effect拥有清理责任</a></h3><p>通过搜索结果乱序返回分析闭包、依赖、结果归属与清理，构造可控 Promise 验证旧请求不会覆盖当前选择。</p><div class="post-bottom"><div class="tags"><span>React</span><span>JavaScript</span><span>Frontend</span><span>Concurrency</span></div><a class="icon-link" href="/zh/blog/react-effect-races/" aria-label="阅读全文: Hooks中的旧闭包与请求竞态：让Effect拥有清理责任"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>

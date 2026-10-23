@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>跨服务调用为什么慢：trace、超时预算与错误关联 — Xiaofeng Qiao</title><meta name="description" content="从排队、并行调用和超时重置分析跨服务延迟，把链路上下文、剩余预算与错误分类分开设计，并用确定性模型验证截止时间不会被下游延长。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/tracing-timeout-budget/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/tracing-timeout-budget/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="跨服务调用为什么慢：trace、超时预算与错误关联 — Xiaofeng Qiao"><meta property="og:description" content="从排队、并行调用和超时重置分析跨服务延迟，把链路上下文、剩余预算与错误分类分开设计，并用确定性模型验证截止时间不会被下游延长。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2022 · 技术回顾</span><span>6 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">跨服务调用为什么慢：trace、超时预算与错误关联</h1><p class="article-deck" itemprop="description">从排队、并行调用和超时重置分析跨服务延迟，把链路上下文、剩余预算与错误分类分开设计，并用确定性模型验证截止时间不会被下游延长。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="有了-trace也不一定知道时间花在哪">有了 trace，也不一定知道时间花在哪</h2>
+<p>一个接口总耗时两百毫秒，数据库 span 只有三十毫秒。若直接得出“数据库不是瓶颈”，可能漏掉取得连接之前排队的一百毫秒。另一个接口并行调用两个八十毫秒的服务，把两个子 span 相加得到一百六十毫秒，也不能据此认定根请求至少等了那么久。</p>
+<p>链路追踪描述一次请求内部的工作关系；超时预算决定系统还愿意为它继续工作多久。这两件事需要协作，但没有自动因果关系。本文从 2022 年跨服务诊断的工程视角作独立分析，采用当时已有的 W3C Trace Context 作为传播基线。所列 OpenTelemetry 页面是今天核查概念的官方资料，不将其后续 SDK 配置或语义字段版本当作当年原样使用。<a href="https://www.w3.org/TR/2021/REC-trace-context-1-20211123/" rel="noopener noreferrer">W3C 2021 版 Trace Context</a></p>
+<h2 id="span-应当围绕能解释的工作边界">span 应当围绕能解释的工作边界</h2>
+<p>一个 span 可以表达接口处理、客户端调用或内部步骤，并通过父子关系串起调用链。排队与真正执行若合在同一个模糊的“数据库操作”里，就很难区分连接池拥堵和查询本身变慢。反过来，对每一行循环都建立 span，又可能制造难以阅读的噪音。<a href="https://opentelemetry.io/docs/concepts/signals/traces/" rel="noopener noreferrer">OpenTelemetry traces 概念</a></p>
+<p>比较实用的划分是：入口处理、连接或任务队列等待、远程调用、关键本地计算和结果序列化。对示例接口可以列出时间线，而不是只看一张总耗时表：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th style="text-align:right">构造示例的耗时</th>
+<th>需要继续核查的方向</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>取得连接前等待</td>
+<td style="text-align:right">60 ms</td>
+<td>并发上限、连接泄漏、突发负载</td>
+</tr>
+<tr>
+<td>调用下游</td>
+<td style="text-align:right">90 ms</td>
+<td>网络、下游排队、执行时间</td>
+</tr>
+<tr>
+<td>本地组装与返回</td>
+<td style="text-align:right">20 ms</td>
+<td>大对象、序列化、响应写入</td>
+</tr>
+</tbody>
+</table>
+<p>这些数字只用于说明推理方法。真正判断瓶颈还要看大量请求的分布、错误和负载，不能从一条恰好很慢的 trace 推断整个系统。并行子工作要看重叠区间和关键路径；父 span 通常已经包含子 span 时间，层层相加会重复计算。</p>
+<h2 id="先让上下文穿过边界再关联日志">先让上下文穿过边界，再关联日志</h2>
+<p>跨 HTTP 服务时，可由正确配置的传播器注入和提取 <code>traceparent</code> 等上下文，让下游建立相应的子 span。日志再附带 trace 与 span 标识，便于从错误找到同一次调用。只在各服务生成本地请求号，无法自动拼成同一条链。<a href="https://opentelemetry.io/docs/concepts/context-propagation/" rel="noopener noreferrer">上下文传播</a></p>
+<p>传播上下文不是身份凭据。来自公网的追踪标识不能赋予调用权限，也不应允许任意输入控制无上限的采样或标签。需要明确入口的校验与信任边界，外发第三方调用时只保留允许传播的内容。尤其不要把令牌、邮箱或原始请求正文塞入 baggage；它可能随着后续网络请求继续流向其他服务。<a href="https://opentelemetry.io/docs/concepts/signals/baggage/" rel="noopener noreferrer">Baggage 的传播与安全边界</a></p>
+<h2 id="每一跳不能重新获得完整超时">每一跳不能重新获得完整超时</h2>
+<p>假设入口总预算是二百毫秒。请求排队八十毫秒后才调用下游，如果下游仍然拿到“超时二百毫秒”，总耗时就可能突破入口原本的承诺。正确的输入是剩余时间，并预留返回和清理成本。</p>
+<p>下面的纯函数表达一条本地预算规则，单位为毫秒：</p>
+<pre><code class="language-javascript">function timeoutBudget(deadline, now, cap, reserve) {
+  if (![deadline, now, cap, reserve].every(Number.isFinite)
+      || cap &lt;= 0 || reserve &lt; 0) {
+    throw new Error('invalid budget');
+  }
+  const available = deadline - now - reserve;
+  if (available &lt;= 0) throw new Error('deadline exhausted');
+  return Math.min(cap, available);
+}
+
+// 总截止时间200，排队已消耗80，返回预留20：下游最多100
+timeoutBudget(200, 80, 500, 20); // 100
+</code></pre>
+<p><code>cap</code> 是这个依赖允许的最长等待，<code>reserve</code> 是调用方为自己留出的尾部预算。串行调用每次都重新计算；并行调用可以共用父截止时间，但仍须各自受依赖上限约束。取消一个分支之后，还要决定是否继续等待其他分支，不能只在图上把它标成红色。</p>
+<p>本地时间差宜使用单调时钟，避免系统校时改变持续时间。跨机器传递绝对截止时刻则需要时钟同步与偏差预算；传递剩余时长也要考虑网络与排队消耗。应选择明确协议并在入口收紧到服务自己的最大预算。自定义截止时间头不是 W3C <code>traceparent</code> 的一部分，也不应信任公网调用方任意传来的超大值。</p>
+<h2 id="超时返回与工作停止是两个结果">超时返回与工作停止是两个结果</h2>
+<p><code>Promise.race</code> 让调用方先得到超时，不表示数据库查询或远端请求真的停止。驱动、HTTP 客户端和服务端任务必须分别支持取消，并把取消信号传下去；不支持取消的工作仍可能占用连接，甚至最终提交业务变化。</p>
+<p>这也影响错误语义。调用方超时只能证明结果尚未被它确认，不能直接当成下游没有执行。写接口需要幂等键或结果查询；只读聚合可以考虑部分结果，但必须明确标记缺失内容，不能把失败分支静默当作空数据。对数据库连接的归还也要放在可靠的清理路径，避免一次超时留下后续排队。</p>
+<h2 id="错误分类应能指导下一次检查">错误分类应能指导下一次检查</h2>
+<p>把所有失败都记录成 <code>unknown_error</code>，追踪系统只会成为更昂贵的日志检索。可以区分预算耗尽、取得连接超时、依赖返回错误、参数拒绝和主动取消；记录稳定的错误类别及依赖名称，不把带用户输入的 URL 当作高基数指标标签。</p>
+<p>重试也应是可见的独立尝试，并共享原来的总预算。否则看起来每次下游都很快，根请求却因为多次重试持续变慢。追踪采样会影响看到哪些请求，所以不能只用被采样 trace 计算整站 p99；延迟直方图、错误计数和 trace 用于不同层面的判断，互相印证比从一个漂亮瀑布图下结论可靠。</p>
+<h2 id="用确定性预算测试再做集成演练">用确定性预算测试，再做集成演练</h2>
+<p>随稿 <code>examples/timeout_budget.mjs</code> 已在 Node.js 16.16.0 执行九组检查：依赖上限、排队消耗、尾部预留、已过期拒绝、预算不足拒绝、子截止时间不延长父时间、公网输入不扩大预算、可信输入仍受本地上限约束，以及非法预算拒绝。时钟作为参数输入，没有真实等待，边界可以重复验证。</p>
+<p>这只是预算与信任边界模型，未安装 OpenTelemetry SDK，也没有验证采集器、跨机器时钟、驱动取消或网络故障。实际接入后应做一条经过网关、服务、数据库的测试链，核对父子关系、日志关联、超时后的资源释放，以及采集系统不可用时业务是否仍能受控运行。观测链路也应有容量和失败策略，不能让遥测出口变成接口新的阻塞点。</p>
+<h2 id="结论">结论</h2>
+<p>trace 帮助解释“发生了哪些工作”，预算约束“还允许做多少工作”，取消与清理决定“超时后还留下什么”。把三者分别实现并放到同一条故障演练里，才能从可观察走到可恢复，而不只是获得更多耗时数字。</p>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2022/">2022 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/api/"># API</a><a href="/zh/blog/tags/opentelemetry/"># OpenTelemetry</a><a href="/zh/blog/tags/backend/"># Backend</a><a href="/zh/blog/tags/reliability/"># Reliability</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#有了-trace也不一定知道时间花在哪" class="toc-level-2">有了 trace，也不一定知道时间花在哪</a><a href="#span-应当围绕能解释的工作边界" class="toc-level-2">span 应当围绕能解释的工作边界</a><a href="#先让上下文穿过边界再关联日志" class="toc-level-2">先让上下文穿过边界，再关联日志</a><a href="#每一跳不能重新获得完整超时" class="toc-level-2">每一跳不能重新获得完整超时</a><a href="#超时返回与工作停止是两个结果" class="toc-level-2">超时返回与工作停止是两个结果</a><a href="#错误分类应能指导下一次检查" class="toc-level-2">错误分类应能指导下一次检查</a><a href="#用确定性预算测试再做集成演练" class="toc-level-2">用确定性预算测试，再做集成演练</a><a href="#结论" class="toc-level-2">结论</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="react19-action-recovery"><div class="post-meta"><span class="note-year">2024 · 技术回顾</span><span>8 分钟阅读</span></div><h3><a href="/zh/blog/react19-action-recovery/">React19表单交互：乐观更新、失败恢复与服务端约定</a></h3><p>利用 Actions、useActionState 和 useOptimistic 表达提交过程，同时保留草稿、区分未知结果与业务冲突，并用稳定操作键控制失败后的重试。</p><div class="post-bottom"><div class="tags"><span>React</span><span>Frontend</span><span>API</span><span>Reliability</span></div><a class="icon-link" href="/zh/blog/react19-action-recovery/" aria-label="阅读全文: React19表单交互：乐观更新、失败恢复与服务端约定"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="redis-cache-recovery"><div class="post-meta"><span class="note-year">2020 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/redis-cache-recovery/">缓存失效后的高峰：Redis回源、过期抖动与故障降级</a></h3><p>分析热点失效时的回源放大、刷新租约过期与旧值覆盖，使用所有者令牌和原子发布限定刷新资格，并明确陈旧数据与数据库一致性的边界。</p><div class="post-bottom"><div class="tags"><span>Redis</span><span>Cache</span><span>Backend</span><span>Reliability</span></div><a class="icon-link" href="/zh/blog/redis-cache-recovery/" aria-label="阅读全文: 缓存失效后的高峰：Redis回源、过期抖动与故障降级"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>

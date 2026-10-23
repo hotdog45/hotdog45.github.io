@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Go服务如何停止：context取消、goroutine退出与资源归还 — Xiaofeng Qiao</title><meta name="description" content="以一个有界并发处理器为例，拆开取消通知、阻塞点退出和完成等待，建立可以验证的资源生命周期。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/go-cancellation-lifecycle/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/go-cancellation-lifecycle/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="Go服务如何停止：context取消、goroutine退出与资源归还 — Xiaofeng Qiao"><meta property="og:description" content="以一个有界并发处理器为例，拆开取消通知、阻塞点退出和完成等待，建立可以验证的资源生命周期。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2020 · 技术回顾</span><span>7 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">Go服务如何停止：context取消、goroutine退出与资源归还</h1><p class="article-deck" itemprop="description">以一个有界并发处理器为例，拆开取消通知、阻塞点退出和完成等待，建立可以验证的资源生命周期。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="请求结束工作为什么还在继续">请求结束，工作为什么还在继续</h2>
+<p>设想一个报表接口：它把一批条目分给几个 worker，逐个查询依赖，再将结果汇总。调用方关闭页面后，HTTP 请求已经取消，但进程的连接数没有下降。继续增加并发，只会让问题更难复现。</p>
+<p>这类问题的起点通常不是缺少 <code>context.Context</code>，而是生命周期没有闭合：有人发出停止通知，却没有人保证生产者、发送者和依赖调用都能退出。</p>
+<p>本文从 <strong>2020 年 Go 1.15 的能力基线</strong>回看这个问题。配套代码只用当时已有的标准库 API，实际在 2026 年使用本机 Go 1.23.3 验证；这是一份在 2026 年整理的工程分析示例。现代的 <code>WithCancelCause</code> 不在示例中，它到 Go 1.20 才加入。<a href="https://go.dev/doc/go1.15" rel="noopener noreferrer">Go 版本说明</a>与<a href="https://pkg.go.dev/context" rel="noopener noreferrer">context API 文档</a>可以用于核对这个边界。</p>
+<h2 id="先为每一种资源找到归还者">先为每一种资源找到归还者</h2>
+<p>“请求函数返回”不能自动证明它启动的工作都已完成。对这个处理器，先写下四个不变量：</p>
+<ol>
+<li>任一条目失败后，不再把部分结果包装为完整报表。</li>
+<li>上游取消后，任务分发和结果发送均有退出路径。</li>
+<li>函数返回前，自己启动的生产者与 worker 已经结束。</li>
+<li>并发数有上限，不能为每个输入无限创建 goroutine。</li>
+</ol>
+<p>其中第三点最容易遗漏。<code>cancel()</code> 负责通知，等待需要另外安排。官方 <code>context</code> 文档也明确区分了取消通知和工作停止。<a href="https://pkg.go.dev/context#CancelFunc" rel="noopener noreferrer">context 取消约定</a></p>
+<table>
+<thead>
+<tr>
+<th>对象</th>
+<th>谁创建</th>
+<th>谁结束或归还</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>派生 context</td>
+<td>处理器</td>
+<td>处理器在所有返回路径调用 cancel</td>
+</tr>
+<tr>
+<td>jobs channel</td>
+<td>处理器</td>
+<td>唯一生产者结束后关闭</td>
+</tr>
+<tr>
+<td>results channel</td>
+<td>处理器</td>
+<td>全部发送者结束后，由协调者关闭</td>
+</tr>
+<tr>
+<td>worker</td>
+<td>处理器</td>
+<td>worker 自己退出，处理器等待</td>
+</tr>
+<tr>
+<td>HTTP 响应体、游标</td>
+<td>实际依赖函数</td>
+<td>取得资源的依赖函数及时关闭</td>
+</tr>
+</tbody>
+</table>
+<p>这个表还没有替代码证明安全，但能暴露缺口：如果某个资源的归还者是“应该会自动释放”，就需要进一步检查。</p>
+<h2 id="一个阻塞点就需要一个停止出口">一个阻塞点，就需要一个停止出口</h2>
+<p>下面是配套 <code>Map</code> 处理器中 worker 的核心部分。<code>work</code> 接收同一个派生 context；结果发送也监听取消，而不是只在进入函数时检查一次。</p>
+<pre><code class="language-go">for j := range jobs {
+    if ctx.Err() != nil {
+        return
+    }
+    value, err := work(ctx, j.value)
+    select {
+    case results &lt;- result{j.index, value, err}:
+    case &lt;-ctx.Done():
+        return
+    }
+    if err != nil {
+        return
+    }
+}
+</code></pre>
+<p>这里的 <code>ctx.Err()</code> 会在检查时已取消的情况下直接退出，不能替代 <code>work</code> 内部的取消支持。检查与调用不是原子操作，取消也可能恰好发生在两者之间。若 <code>work</code> 调用了一个永不返回、也不观察 context 的第三方函数，外层 select 无法强制终止它。此时需要给底层连接配置超时、使用支持取消的客户端，或者把不可控工作隔离为受控进程。为了让接口“尽快返回”而丢下它，并没有解决资源问题。</p>
+<p>生产者同样通过 <code>select</code> 发送任务，取消时返回，并用 <code>defer close(jobs)</code> 结束输入。不能让下游关闭 jobs 来表达取消：生产者可能仍在发送，从而触发向已关闭 channel 发送的 panic。</p>
+<p>还要避免一个更隐蔽的假设：select 不会赋予取消分支固定优先级。当发送和取消都已就绪时，发送仍可能被选择。因此，“调用 cancel 后一个结果也不再出现”不是这份接口的保证。它保证的是取消能够传播、所有自有工作可退出、最终返回准确的失败状态。若业务要求某个时点之后绝不产生写入，需要在实际写入方另行实施版本检查或状态约束，不能让 context 承担一个跨组件的原子事务承诺。</p>
+<h2 id="关闭-channel-和等待必须有明确顺序">关闭 channel 和等待，必须有明确顺序</h2>
+<p>多个 worker 共同发送结果，任何一个 worker 都不拥有 results 的关闭权。示例用同一个 <code>WaitGroup</code> 跟踪生产者与所有 worker，在它们全部退出后关闭结果通道：</p>
+<pre><code class="language-go">go func() {
+    group.Wait()
+    close(results)
+}()
+
+output := make([]int, len(values))
+var firstErr error
+for r := range results {
+    if r.err != nil &amp;&amp; firstErr == nil {
+        firstErr = r.err
+        cancel()
+    }
+    output[r.index] = r.value
+}
+if firstErr != nil {
+    return nil, firstErr
+}
+if err := parent.Err(); err != nil {
+    return nil, err
+}
+return output, nil
+</code></pre>
+<p>汇总方收到第一个错误后取消剩余工作，但继续等待 results 关闭。这样既能传播错误，也能确认这次调用拥有的工作已经收尾。成功结果按输入序号写入数组，不依赖 worker 完成顺序。</p>
+<p>这份实现选择“任一失败，整体失败”。如果业务允许部分成功，返回类型应显式包含每项状态及完整度，不能只保留成功项，再以 <code>nil</code> 错误掩盖缺失。是否保留部分结果是业务约定，不是并发工具替团队做的决定。</p>
+<h2 id="为什么扩大缓冲区常常只是推迟问题">为什么扩大缓冲区常常只是推迟问题</h2>
+<p>把 results 缓冲区从 1 改成 100，可能让小样本不再挂住。它成立的前提却是：未被消费的结果永远不超过 100。输入一变大，或者调用方更早退出，阻塞就会回来。</p>
+<p>Go 官方的流水线文章讨论了下游提前停止消费时的泄漏路径；它给出的关键提醒，是让上游能够收到停止信号，而不是依靠猜测缓冲容量。<a href="https://go.dev/blog/pipelines" rel="noopener noreferrer">Pipelines and cancellation</a></p>
+<p>缓冲区仍然有价值：它可以吸收短暂速度差，减少同步开销。但它不应承担“保证取消后退出”这个职责。为吞吐调节缓冲，为停止设计协议，这两个问题需要分别验证。</p>
+<h2 id="验证退出不只验证算出来的值">验证退出，不只验证算出来的值</h2>
+<p>正常路径的测试检查输入顺序和完整结果。错误路径则要求返回错误且结果为 <code>nil</code>。更关键的测试是让两个 worker 都进入可取消的阻塞操作，然后取消父 context：</p>
+<pre><code class="language-go">atomic.AddInt32(&amp;active, 1)
+defer atomic.AddInt32(&amp;active, -1)
+started &lt;- struct{}{}
+&lt;-ctx.Done()
+return 0, ctx.Err()
+</code></pre>
+<p>测试等待两个 started 信号后才调用 cancel，避免用睡眠猜测调度时机；<code>Map</code> 返回时，active 必须已经回到零。测试的超时只作为防止挂死的上限，不作为性能基准。这比比较整个测试进程的 goroutine 总数更直接，因为测试运行器和其他测试也可能创建 goroutine。</p>
+<p>配套还检查预先取消时不调用 work、非法并发数被拒绝。建议运行：</p>
+<pre><code class="language-bash">go test -race -count=30 ./...
+go vet ./...
+</code></pre>
+<p>竞态检测能发现实际执行路径上的数据竞争，不能证明所有调度都安全；30 次重复也不是形式化证明。仍需结合关闭权和等待关系审查代码。示例没有接数据库或真实 HTTP 服务，因此连接关闭、驱动取消行为和进程退出信号需要在实际集成环境另外验证。</p>
+<h2 id="停止能力是接口的一部分">停止能力是接口的一部分</h2>
+<p>一个可靠的并发接口，除了输入和输出，还应约定：谁可以取消、哪些调用响应取消、谁关闭资源、返回时还有没有后台工作。把这些条件写进代码和测试，比“所有函数都传了 context”更接近真正的可控并发。</p>
+<p>示例的使用边界也很清楚：适合一次请求内、有界、可取消的任务汇总；不适合把已经对外承诺必须完成的任务仅绑定到浏览器请求。后者应该有持久化任务状态和独立生命周期，另行处理恢复、重复执行及补偿。</p>
+<h2 id="参考与验证范围">参考与验证范围</h2>
+<ul>
+<li><a href="https://go.dev/doc/go1.15" rel="noopener noreferrer">Go 1.15 Release Notes</a>：历史语言与标准库基线。</li>
+<li><a href="https://pkg.go.dev/context" rel="noopener noreferrer">context 标准库文档</a>：取消通知、cancel 的使用约定和 API 版本。</li>
+<li><a href="https://go.dev/blog/pipelines" rel="noopener noreferrer">Go Concurrency Patterns: Pipelines and cancellation</a>：提前停止消费时的发送阻塞与通道关闭问题。</li>
+<li>配套示例：<code>examples/go-cancellation/</code>，包含完整处理器和五项测试。实际执行记录保存在本组 <code>quality.json</code>，不以本文替代生产环境集成验收。</li>
+</ul>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2020/">2020 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/go/"># Go</a><a href="/zh/blog/tags/concurrency/"># Concurrency</a><a href="/zh/blog/tags/backend/"># Backend</a><a href="/zh/blog/tags/testing/"># Testing</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#请求结束工作为什么还在继续" class="toc-level-2">请求结束，工作为什么还在继续</a><a href="#先为每一种资源找到归还者" class="toc-level-2">先为每一种资源找到归还者</a><a href="#一个阻塞点就需要一个停止出口" class="toc-level-2">一个阻塞点，就需要一个停止出口</a><a href="#关闭-channel-和等待必须有明确顺序" class="toc-level-2">关闭 channel 和等待，必须有明确顺序</a><a href="#为什么扩大缓冲区常常只是推迟问题" class="toc-level-2">为什么扩大缓冲区常常只是推迟问题</a><a href="#验证退出不只验证算出来的值" class="toc-level-2">验证退出，不只验证算出来的值</a><a href="#停止能力是接口的一部分" class="toc-level-2">停止能力是接口的一部分</a><a href="#参考与验证范围" class="toc-level-2">参考与验证范围</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="java-future-pools"><div class="post-meta"><span class="note-year">2017 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/java-future-pools/">Java异步任务：CompletableFuture、线程池与超时传播</a></h3><p>从一个有界线程池出发，说明异步组合、队列饱和、等待超时和底层工作取消为什么是四个不同问题。</p><div class="post-bottom"><div class="tags"><span>Java</span><span>Concurrency</span><span>Backend</span><span>Testing</span></div><a class="icon-link" href="/zh/blog/java-future-pools/" aria-label="阅读全文: Java异步任务：CompletableFuture、线程池与超时传播"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="postgres-transaction-invariants"><div class="post-meta"><span class="note-year">2019 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/postgres-transaction-invariants/">订单一致性：PostgreSQL事务隔离与乐观并发控制</a></h3><p>用最后一件库存的并发预留解释事务不变量、条件更新、请求去重与版本比较，并给出可复现的双会话 SQL 实验和验证边界。</p><div class="post-bottom"><div class="tags"><span>PostgreSQL</span><span>SQL</span><span>Backend</span><span>Concurrency</span></div><a class="icon-link" href="/zh/blog/postgres-transaction-invariants/" aria-label="阅读全文: 订单一致性：PostgreSQL事务隔离与乐观并发控制"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>

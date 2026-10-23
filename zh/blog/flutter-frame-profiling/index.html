@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flutter卡顿定位：用帧时间和对照实验替代猜测 — Xiaofeng Qiao</title><meta name="description" content="区分UI与Raster阶段，正确处理刷新率、分位数和流水线统计，再用受控实验判断优化是否真正有效。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/flutter-frame-profiling/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/flutter-frame-profiling/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="Flutter卡顿定位：用帧时间和对照实验替代猜测 — Xiaofeng Qiao"><meta property="og:description" content="区分UI与Raster阶段，正确处理刷新率、分位数和流水线统计，再用受控实验判断优化是否真正有效。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2022 · 技术回顾</span><span>7 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">Flutter卡顿定位：用帧时间和对照实验替代猜测</h1><p class="article-deck" itemprop="description">区分UI与Raster阶段，正确处理刷新率、分位数和流水线统计，再用受控实验判断优化是否真正有效。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="同样是列表滑动不顺优化方向可能完全相反">同样是列表滑动不顺，优化方向可能完全相反</h2>
+<p>商品列表快速滑动时，第一反应常是“减少setState”或“给图片加缓存”。但如果真正耗时在栅格化、图片解码或复杂图层组合，调整状态管理方式可能几乎没有作用。反过来，界面构建里同步执行大量数据处理，也不能靠增加RepaintBoundary解决。</p>
+<p>本文在2026年回顾Flutter 3所处的2022年工程背景，重点讨论可迁移的诊断方法。Flutter 3发布于2022年5月；具体DevTools界面、渲染后端和采集API应按当前项目锁定的SDK核对，不把今天的默认配置当作2022年的配置。<a href="https://flutter.dev/blog/introducing-flutter-3" rel="noopener noreferrer">Flutter 3官方发布说明</a></p>
+<p>目标不是先挑一种优化技巧，而是建立一个能重复的问题：固定数据与图片尺寸，进入同一页面，完成同样的滚动动作，记录设备、刷新率、构建模式、冷热状态及追踪文件。没有这个基线，“感觉顺滑了一点”很难与网络缓存、设备温度或不同手势区分。</p>
+<h2 id="先分辨工作在哪个阶段">先分辨工作在哪个阶段</h2>
+<p>DevTools把帧的UI与Raster工作分开展示。UI侧执行Dart和框架相关工作，Raster侧把绘制描述转成实际图形工作；某个阶段超出预算，提示应该优先调查那一侧，而不是立刻证明了某一个Widget有问题。<a href="https://docs.flutter.dev/tools/devtools/performance" rel="noopener noreferrer">官方Performance视图</a></p>
+<p>UI侧的线索可能来自重复构建、大量同步计算、布局依赖或垃圾回收。Raster侧则可能涉及图层、离屏绘制、裁剪、阴影和过大的图像。减少一部分重建可以帮助UI阶段，却未必减少Raster成本；增加缓存或独立重绘边界，也可能以更多内存和图层管理换取部分绘制复用。判断收益时要同时看目标阶段和代价，不能只盯着一个变绿的柱子。</p>
+<p>采集还需要合理环境。Flutter官方建议在真实设备的profile模式分析性能，debug模式和模拟器的结果不宜直接代表发布行为。本次文章只运行统计程序，没有采集某台手机的实际帧数据。<a href="https://docs.flutter.dev/perf/ui-performance" rel="noopener noreferrer">官方性能分析指南</a></p>
+<h2 id="帧预算取决于刷新率阶段耗时也不是端到端延迟">帧预算取决于刷新率，阶段耗时也不是端到端延迟</h2>
+<p>60Hz对应约16.67毫秒一轮，120Hz则约8.33毫秒。相同的10毫秒阶段工作，在两个目标下含义不同。应记录测试时的实际刷新条件，不要把16毫秒写成所有设备永久适用的门槛；动态刷新、调度和系统合成还会影响最终显示。</p>
+<p>另一个常见错误，是把同帧build与raster耗时直接相加，再据此统计“掉帧数”。渲染流水线里不同帧可以处于不同阶段，简单相加并不能代替显示时序分析。FrameTiming还区分了阶段耗时、vsync等待及总跨度，原始时间戳的epoch也不能直接当成墙上时钟时间。<a href="https://api.flutter.dev/flutter/dart-ui/FrameTiming-class.html" rel="noopener noreferrer">FrameTiming API</a></p>
+<p>下面的完整Dart程序只统计“阶段预算超限”的诊断信号。它保留UI、Raster、并集和交集，不把两个计数相加冒充帧数；分位数取每个样本中较长的阶段。输出特意标为阶段诊断，不叫显示帧延迟或用户可见卡顿率。</p>
+<pre><code class="language-dart">import 'dart:convert';
+import 'dart:math';
+
+class Sample {
+  final double buildMs;
+  final double rasterMs;
+  Sample(this.buildMs, this.rasterMs);
+}
+
+Map&lt;String, dynamic&gt; analyze(double hz, List&lt;Sample&gt; samples) {
+  if (!hz.isFinite || hz &lt;= 0 || samples.isEmpty) {
+    throw ArgumentError('positive refresh rate and nonempty samples required');
+  }
+  final double budgetMs = 1000 / hz;
+  int uiSlow = 0, rasterSlow = 0, eitherSlow = 0, bothSlow = 0;
+  final List&lt;double&gt; stageMax = &lt;double&gt;[];
+  for (final Sample sample in samples) {
+    if (!sample.buildMs.isFinite || !sample.rasterMs.isFinite ||
+        sample.buildMs &lt; 0 || sample.rasterMs &lt; 0) {
+      throw ArgumentError('finite nonnegative durations required');
+    }
+    final bool ui = sample.buildMs &gt; budgetMs;
+    final bool raster = sample.rasterMs &gt; budgetMs;
+    if (ui) uiSlow += 1;
+    if (raster) rasterSlow += 1;
+    if (ui || raster) eitherSlow += 1;
+    if (ui &amp;&amp; raster) bothSlow += 1;
+    stageMax.add(max(sample.buildMs, sample.rasterMs));
+  }
+  stageMax.sort();
+  return &lt;String, dynamic&gt;{
+    'samples': samples.length,
+    'refreshHz': hz,
+    'stageBudgetMs': budgetMs,
+    'uiOverBudget': uiSlow,
+    'rasterOverBudget': rasterSlow,
+    'eitherOverBudget': eitherSlow,
+    'bothOverBudget': bothSlow,
+    'stageMaxP95Ms': stageMax[(0.95 * stageMax.length).ceil() - 1],
+    'measurementKind': 'synthetic stage diagnostics, not displayed-frame latency',
+  };
+}
+
+void check(bool condition, String name) {
+  if (!condition) throw StateError(name);
+}
+
+void main() {
+  final Map&lt;String, dynamic&gt; report = analyze(60, &lt;Sample&gt;[
+    Sample(4, 5), Sample(20, 7), Sample(7, 22), Sample(18, 21),
+  ]);
+  check(report['uiOverBudget'] == 2, 'UI diagnosis');
+  check(report['rasterOverBudget'] == 2, 'raster diagnosis');
+  check(report['eitherOverBudget'] == 3, 'union, not sum');
+  check(report['bothOverBudget'] == 1, 'overlap retained');
+  check(report['stageMaxP95Ms'] == 22, 'nearest-rank diagnostic percentile');
+  check(analyze(60, &lt;Sample&gt;[Sample(10, 10)])['eitherOverBudget'] == 0,
+      'do not sum pipelined stages');
+  check(analyze(120, &lt;Sample&gt;[Sample(10, 10)])['bothOverBudget'] == 1,
+      'refresh rate changes budget');
+  int rejected = 0;
+  for (final void Function() invalid in &lt;void Function()&gt;[
+    () =&gt; analyze(0, &lt;Sample&gt;[Sample(1, 1)]),
+    () =&gt; analyze(60, &lt;Sample&gt;[]),
+    () =&gt; analyze(60, &lt;Sample&gt;[Sample(double.nan, 1)]),
+  ]) {
+    try { invalid(); } on ArgumentError { rejected += 1; }
+  }
+  check(rejected == 3, 'invalid inputs rejected');
+  print(jsonEncode(&lt;String, dynamic&gt;{'assertions': 10, 'fixtureReport': report}));
+}
+</code></pre>
+<h2 id="先验证统计方法再讨论优化收益">先验证统计方法，再讨论优化收益</h2>
+<p>程序中的4、20、22毫秒等值都是人为fixture。它们用来证明计数口径和分位数算法，不是某个应用的性能成绩。四个样本采用nearest-rank计算P95时，结果恰好落在最大值上；如此小的数据集不适合推断真实用户群体的尾部体验。</p>
+<p>本次以Dart 3.6.0运行，静态分析无问题。十项检查覆盖UI与Raster分类、并集去重、交集、分位数、流水线阶段不直接求和、120Hz预算以及三类无效输入。实际接入可从FrameTiming获取阶段时长，再按明确的数据格式导出；同时记录采样区间和缺失样本，不能把空数据集输出为“零卡顿”。</p>
+<pre><code class="language-bash">dart analyze flutter_frame_analysis.dart
+dart run flutter_frame_analysis.dart
+</code></pre>
+<h2 id="从一张慢帧走到一个可证伪的解释">从一张慢帧走到一个可证伪的解释</h2>
+<p>一次可检验的假设应该具体到动作和成本，例如“列表每次更新都会在UI侧重新排序同一批数据”，而不是“这个页面架构不够好”。先在追踪里定位对应工作，再用固定输入把排序预先完成，检查目标阶段是否随之变化。若阶段耗时没有明显变化，这个解释就需要被修正，而不是继续为原猜测添加更多优化。</p>
+<p>另一个假设可能是某类图层效果导致Raster成本偏高。可以在实验分支替换单一效果来确认方向，但如果因此删掉了产品必需的视觉内容，就不能直接把这个分支作为优化完成的结果。诊断用的简化和最终保持功能、视觉质量的实现，是两个不同交付阶段。</p>
+<p>采样也需要保留异常语境。首次进入页面、图片首次加载、重复进入和稳定滚动应分别观察，不能把最慢的一段无理由删除后只保留热状态结果。相反，把启动阶段和长期滚动全部揉成一个平均数，也可能让两个完全不同的问题互相掩盖。记录动作区间，比无限扩大一个缺少标签的数据集更有价值。</p>
+<h2 id="一次只改变一个假设">一次只改变一个假设</h2>
+<p>假设UI阶段异常，可以先检查滑动期间是否重复进行相同的数据转换，再把预计算与原实现做对照，而不是同时更换状态库、缓存策略和列表组件。若Raster阶段更突出，则从追踪中的具体绘制行为入手，分别检查图片尺寸、复杂层与重复绘制。把所有改动一起提交，最后即使数据更好，也很难知道哪一项值得保留。</p>
+<p>对照实验应使用同一设备、构建方式和输入，冷热启动分别比较，多次重复并保留每轮数据。先做A再做B可能受到缓存或温度影响，可以交替顺序并检查后台负载。采集过多详细追踪本身也可能增加成本；定位用重追踪与最终验收的采集设置应分别说明。</p>
+<p>平均帧耗时下降也未必解决体验问题：少数很慢的长帧可能依然出现在用户点击后。除了阶段分位数，要回到具体交互观察输入响应、首屏可见时间和内存变化。若优化只让热缓存滚动更快，却让冷启动明显变慢，需要把这个取舍交给产品场景判断。</p>
+<p>还可以先做一次不修改代码的重复基线，了解同一操作自身的波动范围。若两轮基线之间已经相差很大，直接把第三轮的下降归功于代码改动并不可靠。应先查明运行环境和输入是否一致，再决定需要多少次重复与哪些验收门槛。</p>
+<p>可复现的性能结论应包含问题动作、环境、统计口径、原始证据和代价。没有这些内容，不能把fixture输出写成“提升30%”；具备这些内容，即使最终发现瓶颈在网络或图片而非Widget构建，也是一项有效的工程结果。</p>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2022/">2022 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/flutter/"># Flutter</a><a href="/zh/blog/tags/dart/"># Dart</a><a href="/zh/blog/tags/performance/"># Performance</a><a href="/zh/blog/tags/testing/"># Testing</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#同样是列表滑动不顺优化方向可能完全相反" class="toc-level-2">同样是列表滑动不顺，优化方向可能完全相反</a><a href="#先分辨工作在哪个阶段" class="toc-level-2">先分辨工作在哪个阶段</a><a href="#帧预算取决于刷新率阶段耗时也不是端到端延迟" class="toc-level-2">帧预算取决于刷新率，阶段耗时也不是端到端延迟</a><a href="#先验证统计方法再讨论优化收益" class="toc-level-2">先验证统计方法，再讨论优化收益</a><a href="#从一张慢帧走到一个可证伪的解释" class="toc-level-2">从一张慢帧走到一个可证伪的解释</a><a href="#一次只改变一个假设" class="toc-level-2">一次只改变一个假设</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="flutter-migration-boundaries"><div class="post-meta"><span class="note-year">2018 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/flutter-migration-boundaries/">Flutter初次迁移：先定义原生边界，再移动业务流程</a></h3><p>以订单详情的渐进迁移为例，拆开导航、会话与副作用归属，给跨端消息定义可测试的协议和回退条件。</p><div class="post-bottom"><div class="tags"><span>Flutter</span><span>Dart</span><span>Architecture</span><span>Mobile</span><span>API</span></div><a class="icon-link" href="/zh/blog/flutter-migration-boundaries/" aria-label="阅读全文: Flutter初次迁移：先定义原生边界，再移动业务流程"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="java-virtual-thread-backpressure"><div class="post-meta"><span class="note-year">2023 · 技术回顾</span><span>6 分钟阅读</span></div><h3><a href="/zh/blog/java-virtual-thread-backpressure/">Java虚拟线程：I/O并发增加后，数据库连接池怎么办</a></h3><p>把虚拟线程的调度能力与下游容量分开，使用有期限的许可控制、入口限流和可验证的资源归还保护服务。</p><div class="post-bottom"><div class="tags"><span>Java</span><span>Concurrency</span><span>Architecture</span><span>Testing</span></div><a class="icon-link" href="/zh/blog/java-virtual-thread-backpressure/" aria-label="阅读全文: Java虚拟线程：I/O并发增加后，数据库连接池怎么办"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>

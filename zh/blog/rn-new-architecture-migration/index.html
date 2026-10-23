@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>React Native新架构迁移：兼容层、原生模块与回归矩阵 — Xiaofeng Qiao</title><meta name="description" content="以RN0.76为历史锚点，拆开运行时升级、原生依赖迁移和业务验收，用显式证据门槛避免把能编译误当成迁移完成。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/rn-new-architecture-migration/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/rn-new-architecture-migration/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="React Native新架构迁移：兼容层、原生模块与回归矩阵 — Xiaofeng Qiao"><meta property="og:description" content="以RN0.76为历史锚点，拆开运行时升级、原生依赖迁移和业务验收，用显式证据门槛避免把能编译误当成迁移完成。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2024 · 技术回顾</span><span>7 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">React Native新架构迁移：兼容层、原生模块与回归矩阵</h1><p class="article-deck" itemprop="description">以RN0.76为历史锚点，拆开运行时升级、原生依赖迁移和业务验收，用显式证据门槛避免把能编译误当成迁移完成。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="升级成功之后为什么相机页面仍可能出问题">升级成功之后，为什么相机页面仍可能出问题</h2>
+<p>一个混合应用升级后能启动、首页也正常，但打开相机才出现原生模块异常；另一端可以拍照，退出登录后再进入却仍拿到旧会话的数据。这样的故障提示：运行时升级、原生依赖兼容和业务流程正确，是三件需要分别证明的事。</p>
+<p>本文在2026年回顾RN 0.76于2024年10月默认启用新架构这一节点。0.76时期的迁移选项只作为该版本背景，今天实施必须重新核实目标版本支持范围；不能假定所有新版本都保留关闭新架构的开关。<a href="https://reactnative.dev/blog/2024/10/23/release-0.76-new-architecture" rel="noopener noreferrer">0.76官方发布记录</a></p>
+<p>迁移对象以虚构的库存应用为例：现有原生相机与安全存储模块，JS侧提供列表和详情，原生宿主保留会话及导航。先保持业务行为不变，完成可验证的架构升级，再决定是否引入新的并发交互。把这两类变化混在同一批里，会让一个回归现象同时对应多个解释。</p>
+<h2 id="兼容运行不是已经使用所有新能力">“兼容运行”不是“已经使用所有新能力”</h2>
+<p>官方0.76架构说明介绍了自动互操作层，也列出了它的边界。旧模块能通过这一层工作，可以帮助渐进迁移，但不能直接证明自定义原生组件已经具备所有并发特性，也不说明模块已经完成新接口与类型生成的适配。<a href="https://reactnative.dev/blog/2024/10/23/the-new-architecture-is-here" rel="noopener noreferrer">官方迁移说明</a></p>
+<p>因此依赖清单至少要区分三种状态：目标版本明确支持且本项目已验证，能够经兼容层运行但仍有边界，尚未验证或已经失败。包管理器安装成功，只能证明依赖解析和下载，并不能把第三种自动变成第一种。库的公开兼容声明是线索，最终仍需核对自己使用的原生能力和平台版本。</p>
+<p>如果某个关键库暂不兼容，可以评估固定版本、替换实现或缩小首批迁移范围；若目标版本确实支持临时退回旧架构，也应保留可重复构建的旧产物和数据兼容方案。不能只留一句“出问题就把开关关回去”，却没有验证旧产物还能读取新版本写入的数据。</p>
+<h2 id="生成接口约束形状业务还需要自己的验证">生成接口约束形状，业务还需要自己的验证</h2>
+<p>Turbo Native Module的规范文件描述方法和数据类型，Codegen生成与平台相关的接口。当前官方文档还区分了可返回空的模块查询与缺少模块时直接抛错的查询方式；选择哪种应依据该能力是必需还是可降级，而不是一律忽略空值。<a href="https://reactnative.dev/docs/turbo-native-modules-introduction" rel="noopener noreferrer">当前原生模块文档</a></p>
+<p>类型生成可以减少两侧签名漂移，却不会替代权限、会话有效性、重复调用或业务范围检查。一个返回字符串的原生方法，即使签名完全匹配，也可能返回错误用户的数据。接口变动时还应检查生成产物和原生实现是否来自同一版本，避免JS bundle使用新规范、设备里却仍是旧原生包。</p>
+<p>同步访问也不是免费的性能优化。若把磁盘读取或耗时计算放进会阻塞调用方的同步路径，省掉异步消息并不代表交互一定更快。适合短小访问的同步方法，与需要取消、超时和线程调度的长任务，应保持不同的接口约定。</p>
+<p>迁移一个自定义模块时，可以先固定其业务输入输出，再替换内部接入方式。比如安全存储返回“未找到”和“访问失败”本来是两种结果，新接口不应为了适配签名把两者都转成空字符串。相机取消、权限拒绝和真实错误也不应合并成一个布尔值。类型规范要描述业务可区分的结果，回归样例则证明原生实现没有在转换过程中丢失语义。</p>
+<h2 id="把迁移检查做成缺证据就停止的门槛">把迁移检查做成缺证据就停止的门槛</h2>
+<p>下面的完整Node程序演示一份迁移验收清单：两个必需模块，在iOS/Android旧、新路径上都有明确结果；登录过期和权限拒绝等业务场景另行验证；JS与原生规范标识必须一致。这是针对0.76迁移回顾设计的证据模型，不是可直接调用的RN原生模块。</p>
+<pre><code class="language-javascript">'use strict';
+const assert = require('assert');
+
+// Synthetic evidence gate: no native module or RN runtime is loaded.
+const manifest = {
+  runtimeTag: 'rn-0.76-review',
+  schema: 'inventory:v2',
+  modules: ['camera', 'secureStore'],
+  scenarios: ['enter-exit', 'session-expired', 'permission-denied'],
+};
+function assess(required, evidence) {
+  const reasons = [];
+  if (required.runtimeTag !== evidence.runtimeTag) reasons.push('runtime mismatch');
+  if (required.schema !== evidence.jsSchema) reasons.push('JS schema mismatch');
+  ['ios', 'android'].forEach(platform =&gt; {
+    if (!evidence.nativeSchema || evidence.nativeSchema[platform] !== required.schema) {
+      reasons.push(platform + ': native schema mismatch');
+    }
+  });
+  required.modules.forEach(name =&gt; {
+    const module = (evidence.modules || {})[name] || {};
+    ['iosOld', 'androidOld', 'iosNew', 'androidNew'].forEach(cell =&gt; {
+      if (module[cell] !== 'pass') reasons.push(name + ':' + cell + ' not passed');
+    });
+  });
+  required.scenarios.forEach(name =&gt; {
+    const scenario = (evidence.scenarios || {})[name] || {};
+    ['ios', 'android'].forEach(platform =&gt; {
+      if (scenario[platform] !== 'pass') reasons.push(name + ':' + platform + ' not passed');
+    });
+  });
+  return { ready: reasons.length === 0, reasons };
+}
+const fixtureAllPass = {
+  runtimeTag: manifest.runtimeTag, jsSchema: manifest.schema,
+  nativeSchema: { ios: manifest.schema, android: manifest.schema },
+  modules: {}, scenarios: {},
+};
+manifest.modules.forEach(name =&gt; {
+  fixtureAllPass.modules[name] = { iosOld: 'pass', androidOld: 'pass', iosNew: 'pass', androidNew: 'pass' };
+});
+manifest.scenarios.forEach(name =&gt; { fixtureAllPass.scenarios[name] = { ios: 'pass', android: 'pass' }; });
+function copy() { return JSON.parse(JSON.stringify(fixtureAllPass)); }
+assert.strictEqual(assess(manifest, fixtureAllPass).ready, true);
+let changed = copy(); changed.modules.camera.androidNew = 'pending';
+assert.strictEqual(assess(manifest, changed).ready, false);
+changed = copy(); delete changed.modules.secureStore;
+assert.strictEqual(assess(manifest, changed).ready, false);
+changed = copy(); changed.nativeSchema.ios = 'inventory:v1';
+assert.strictEqual(assess(manifest, changed).ready, false);
+changed = copy(); delete changed.scenarios['session-expired'];
+assert.strictEqual(assess(manifest, changed).ready, false);
+changed = copy(); changed.scenarios['permission-denied'].android = 'fail';
+assert.strictEqual(assess(manifest, changed).ready, false);
+changed = copy(); changed.runtimeTag = 'different-runtime';
+assert.strictEqual(assess(manifest, changed).ready, false);
+changed = copy(); changed.jsSchema = 'inventory:v3';
+assert.strictEqual(assess(manifest, changed).ready, false);
+console.log('PASS: 8 evidence-gate assertions; fixture pass does not mean app passed');
+</code></pre>
+<p><code>fixtureAllPass</code>是用于测试成功分支的合成输入，不是一份真实设备报告。把某项改成pending、删除必需模块、制造规范不一致或平台失败，程序都会拒绝放行。规范标识也不是安全签名；实际构建应从受控产物生成版本或哈希，不能让执行者手写一个相同字符串就冒充接口一致。</p>
+<h2 id="先比较旧行为再检查新能力">先比较旧行为，再检查新能力</h2>
+<p>回归矩阵要围绕可观察结果，而不仅是“某页面打开”。相机权限拒绝后应有合理退出路径；原生弹窗关闭后焦点和导航栈应正确；会话失效后不能继续显示上一用户内容；应用切后台再返回时，订阅不能重复注册。业务流程的断言应在两端一致，平台特有交互则保留各自的预期。</p>
+<p>原生组件还要检查布局、测量和事件时序。旧代码如果依赖某个异步回调恰好晚一轮执行，升级后可能暴露原有的隐式假设。应把假设写进契约并修正所有权，而不是在各处增加固定延迟。涉及布局效果与并发特性时，再按目标版本文档逐步引入和测试，避免把“新架构已开启”当成这些行为已经验收。</p>
+<p>矩阵结果还应绑定具体产物。一个月前旧包通过过相机测试，不能自动填进今天新依赖组合的pass单元格。记录构建标识、模块版本和用例结果，既能帮助复现，也能防止不同团队把各自在不同环境中验证的一小部分拼成一份看似完整的报告。某个平台缺少设备或测试权限时，应保留pending，并说明何时由谁补齐。</p>
+<p>本例在Node 16.16.0通过语法检查和八组证据门槛断言，没有运行RN、Codegen或原生构建。真实迁移仍需固定依赖锁文件、构建工具和目标平台，生成接口，编译宿主，并运行设备回归；这些证据缺失时，清单应显示未验证，而不是默认通过。</p>
+<h2 id="迁移完成应交付什么">迁移完成应交付什么</h2>
+<p>可以把完成条件收敛为一份可复查的包：目标运行时与工具版本、依赖状态、接口生成记录、双端业务回归、已知限制及可执行的回退方案。性能收益必须另做真实设备对照，不能从架构名称或上游案例推导出本项目的百分比。这样升级既能逐步获得新能力，也能保留故障定位与责任归属所需的清楚边界。</p>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2024/">2024 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/react-native/"># React-Native</a><a href="/zh/blog/tags/architecture/"># Architecture</a><a href="/zh/blog/tags/testing/"># Testing</a><a href="/zh/blog/tags/native-modules/"># Native-Modules</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#升级成功之后为什么相机页面仍可能出问题" class="toc-level-2">升级成功之后，为什么相机页面仍可能出问题</a><a href="#兼容运行不是已经使用所有新能力" class="toc-level-2">“兼容运行”不是“已经使用所有新能力”</a><a href="#生成接口约束形状业务还需要自己的验证" class="toc-level-2">生成接口约束形状，业务还需要自己的验证</a><a href="#把迁移检查做成缺证据就停止的门槛" class="toc-level-2">把迁移检查做成缺证据就停止的门槛</a><a href="#先比较旧行为再检查新能力" class="toc-level-2">先比较旧行为，再检查新能力</a><a href="#迁移完成应交付什么" class="toc-level-2">迁移完成应交付什么</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="java-virtual-thread-backpressure"><div class="post-meta"><span class="note-year">2023 · 技术回顾</span><span>6 分钟阅读</span></div><h3><a href="/zh/blog/java-virtual-thread-backpressure/">Java虚拟线程：I/O并发增加后，数据库连接池怎么办</a></h3><p>把虚拟线程的调度能力与下游容量分开，使用有期限的许可控制、入口限流和可验证的资源归还保护服务。</p><div class="post-bottom"><div class="tags"><span>Java</span><span>Concurrency</span><span>Architecture</span><span>Testing</span></div><a class="icon-link" href="/zh/blog/java-virtual-thread-backpressure/" aria-label="阅读全文: Java虚拟线程：I/O并发增加后，数据库连接池怎么办"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="ai-evaluation-handoff"><div class="post-meta"><span class="note-year">2026 · 技术回顾</span><span>8 分钟阅读</span></div><h3><a href="/zh/blog/ai-evaluation-handoff/">AI应用如何验收：固定样本、失败分类与人工接管</a></h3><p>把回答质量、操作边界和最终状态分别验证，用可重放的小型评测集检验AI业务流程，并让人工接管有真实回执。</p><div class="post-bottom"><div class="tags"><span>AI</span><span>Evaluation</span><span>Testing</span><span>Architecture</span></div><a class="icon-link" href="/zh/blog/ai-evaluation-handoff/" aria-label="阅读全文: AI应用如何验收：固定样本、失败分类与人工接管"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>

@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>React复杂表单：单向数据流与可测试的状态转换 — Xiaofeng Qiao</title><meta name="description" content="从错误提示、重复提交和异步结果覆盖出发，将类组件表单拆成纯状态转换与副作用适配，保留用户输入并验证失败恢复。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/react-form-state/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/react-form-state/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="React复杂表单：单向数据流与可测试的状态转换 — Xiaofeng Qiao"><meta property="og:description" content="从错误提示、重复提交和异步结果覆盖出发，将类组件表单拆成纯状态转换与副作用适配，保留用户输入并验证失败恢复。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2017 · 技术回顾</span><span>7 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">React复杂表单：单向数据流与可测试的状态转换</h1><p class="article-deck" itemprop="description">从错误提示、重复提交和异步结果覆盖出发，将类组件表单拆成纯状态转换与副作用适配，保留用户输入并验证失败恢复。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="表单难在状态组合不在输入框数量">表单难在状态组合，不在输入框数量</h2>
+<p>一个询价表只有姓名和邮箱，仍然可能出现：按钮显示提交中却允许再次提交，服务端失败后清空用户输入，或者前一次请求的成功提示覆盖后来一次编辑。输入框很少，状态之间的关系却已经复杂起来。</p>
+<p>本文用独立示例回顾 2017 年的 React 类组件设计。React 16 于当年发布，Hooks 要到 2019 年的 16.8 才稳定提供，因此这里讨论 <code>state</code>、函数式 <code>setState</code> 和生命周期边界。配套纯 JavaScript 模型在今天的 Node.js 16.16.0 执行；对象展开等写法是当前复现方式，历史工程还需对应的构建转换配置。<a href="https://legacy.reactjs.org/blog/2017/09/26/react-v16.0.html" rel="noopener noreferrer">React 16 发布记录</a>、<a href="https://legacy.reactjs.org/blog/2019/02/06/react-v16.8.0.html" rel="noopener noreferrer">Hooks 历史时间</a></p>
+<h2 id="先减少互相矛盾的状态">先减少互相矛盾的状态</h2>
+<p>与其维护 <code>isSaving</code>、<code>isDone</code>、<code>hasFailed</code> 三个布尔值，让它们拼出许多没有意义的组合，不如明确主状态只有 <code>editing</code>、<code>submitting</code> 和 <code>success</code>。字段值、字段错误与全局消息分别保存，按钮是否可用由主状态推导，而不是再存一份容易不同步的 <code>canSubmit</code>。</p>
+<p>受控输入让 React 的状态决定显示值，修改从事件进入状态。好处是校验、重置和预览共用同一份数据；代价是每次编辑都要有一致的更新路径。若同时让 DOM 自己改值，又让组件保存另一份草稿，就需要说明两份值谁有优先权。<a href="https://legacy.reactjs.org/docs/forms.html" rel="noopener noreferrer">受控表单说明</a></p>
+<p>这个例子采用提交期间冻结编辑的策略。它适合短表单和较快的保存接口，优点是提交快照与屏幕内容保持一致。长表单可能需要允许继续编辑，此时就要区分“正在保存的版本”和“本地新草稿”，而不是简单删除禁用逻辑。</p>
+<h2 id="把校验和状态变换写成纯函数">把校验和状态变换写成纯函数</h2>
+<p>下面是提交路径的核心，函数只根据输入返回下一份状态，不发网络请求，也不修改原对象：</p>
+<pre><code class="language-javascript">function submitState(state, requestId) {
+  if (state.status === 'submitting') return state;
+  const snapshot = {
+    name: state.values.name.trim(),
+    email: state.values.email.trim()
+  };
+  const errors = {};
+  if (!snapshot.name) errors.name = '请输入姓名';
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(snapshot.email)) {
+    errors.email = '请检查邮箱格式';
+  }
+  if (Object.keys(errors).length) {
+    return Object.assign({}, state, { errors, status: 'editing' });
+  }
+  return Object.assign({}, state, {
+    errors: {}, status: 'submitting', requestId, snapshot, message: ''
+  });
+}
+</code></pre>
+<p>这只是基础格式校验，不宣称正则表达式能证明邮箱真实可达。服务端仍要独立校验所有输入，业务必要时再做邮箱验证。前端在展示字段错误时，应保留原始输入，让用户自己修改；清除错误与清空字段不是同一件事。</p>
+<p>完整模型再接受 <code>change</code>、<code>success</code>、<code>failure</code> 事件。成功或失败必须携带本次请求编号，只有编号与当前提交一致时才接纳结果。失败转回编辑态并保留字段；过期的异步响应直接忽略。这样做的价值在于把异步乱序变成一条能在测试里清楚断言的规则。</p>
+<h2 id="类组件只负责连接事件与副作用">类组件只负责连接事件与副作用</h2>
+<p>依赖旧状态计算下一状态时，使用函数式 <code>setState</code>，避免把 <code>this.state</code> 当作每一次调用后都会立即变化的变量。更新器应保持纯净，网络请求放在更新完成后的回调中，而不是放进可能被重新调用的状态计算函数。<a href="https://legacy.reactjs.org/docs/react-component.html#setstate" rel="noopener noreferrer">setState 的更新语义</a></p>
+<p>适配层可以遵循下面的结构，<code>transition</code> 来自配套状态模型，<code>save</code> 是注入的接口函数：</p>
+<pre><code class="language-javascript">submit(event) {
+  event.preventDefault();
+  if (this.busy) return;
+  this.busy = true;
+  const requestId = ++this.sequence;
+  this.setState(previous =&gt;
+    transition(previous, { type: 'submit', requestId }), () =&gt; {
+      if (this.state.status !== 'submitting') {
+        this.busy = false;
+        return;
+      }
+      const snapshot = this.state.snapshot;
+      Promise.resolve().then(() =&gt; this.props.save(snapshot))
+        .then(() =&gt; this.finish({ type: 'success', requestId }),
+              () =&gt; this.finish({ type: 'failure', requestId }));
+    });
+}
+finish(result) {
+  if (!this.active || result.requestId !== this.state.requestId) return;
+  this.busy = false;
+  this.setState(previous =&gt; transition(previous, result));
+}
+componentDidMount() { this.active = true; }
+componentWillUnmount() { this.active = false; }
+</code></pre>
+<p>构造函数应初始化 <code>busy = false</code>、<code>sequence = 0</code>、<code>active = false</code> 并绑定事件方法。这段展示的是类组件适配方法，不是可直接挂载的完整界面；生产组件还需 <code>render</code>、可访问性属性和真实接口实现。同步的 <code>busy</code> 闸门防止在 React 状态落地前再次触发保存，它服务的是副作用互斥，不应再被拿来驱动一套独立视觉状态。</p>
+<p>卸载后忽略结果只是在保护界面生命周期，不会取消服务端已经接受的操作。用户切页回来时仍要有办法查询保存结果；涉及创建资源的接口，也需要服务端幂等约定。不能把“前端只点了一次”当作后端不会重复写入的保证。</p>
+<h2 id="服务端错误不要变成不可恢复的提示">服务端错误不要变成不可恢复的提示</h2>
+<p>字段错误、鉴权失效、网络失败和业务冲突应该有不同处理。字段错误定位到输入框；网络失败保留草稿并允许重试；鉴权问题引导恢复登录；版本冲突则先读回最新数据。把所有失败都显示成“系统繁忙”，会丢掉用户下一步应该做什么的信息。</p>
+<p>也不要为了清除报错，每次输入就把整个错误对象清空。用户修改邮箱时，只清除邮箱对应错误；姓名错误仍应保留。提交成功后的重置可以是明确按钮，也可以遵循业务流程跳转，避免迟到的成功响应在用户已经开始第二份草稿时突然擦掉内容。</p>
+<h2 id="把事件协议写进协作约定">把事件协议写进协作约定</h2>
+<p>状态转换不需要复杂框架，也可以成为前后端评审的共同语言。<code>submit</code> 表示发起一次确定快照的保存，<code>success</code> 表示当前请求已被接口确认，<code>failure</code> 表示这次保存没有得到可确认的成功结果。三者不能简单对应“点击了按钮”“收到了任意响应”“抛出了任意异常”；否则业务返回了校验失败，界面仍可能进入成功态。</p>
+<p>在接口适配层约定成功响应结构，再把服务端字段名映射到表单字段。无法识别的字段错误应作为全局提示显示，不应动态创建任意状态键。服务端原始堆栈和数据库错误也不适合直接展示。把这些转换集中在一个位置，后续接入新版接口时就能单独测试，不必让每个输入框理解不同的后端错误格式。</p>
+<h2 id="测试转换规则再补浏览器交互">测试转换规则，再补浏览器交互</h2>
+<p>随稿 <code>examples/form_state.mjs</code> 在 Node.js 执行八组行为检查：无效输入阻止提交、提交快照标准化、原状态不被修改、提交期间拦截重复与编辑、忽略旧请求结果、失败后保留字段、正确成功转换，以及拒绝未知字段。测试使用模拟邮箱与姓名，不发送任何请求。</p>
+<p>它没有装载 React 渲染器，因此不能证明 <code>setState</code> 调度、DOM 禁用、中文输入法或键盘焦点已经正确。组件集成测试还应检查：回车与点击是否走同一路径，错误是否通过 <code>aria-describedby</code> 关联字段，异步提交后焦点是否合理，卸载期间有没有残留订阅，以及慢网时能否看懂当前状态。React 官方生命周期说明可作为适配层审阅依据，而不是替代这些交互测试。<a href="https://legacy.reactjs.org/docs/react-component.html" rel="noopener noreferrer">类组件生命周期</a></p>
+<h2 id="结论">结论</h2>
+<p>复杂表单首先需要一份明确的状态协议。把用户草稿、提交快照和请求身份分开，把纯状态变换与网络副作用分开，失败恢复就可以被逐条验证。类组件还是 Hooks 并不改变这些问题；换语法之前，先把不允许出现的状态组合消掉。</p>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2017/">2017 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/react/"># React</a><a href="/zh/blog/tags/javascript/"># JavaScript</a><a href="/zh/blog/tags/frontend/"># Frontend</a><a href="/zh/blog/tags/testing/"># Testing</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#表单难在状态组合不在输入框数量" class="toc-level-2">表单难在状态组合，不在输入框数量</a><a href="#先减少互相矛盾的状态" class="toc-level-2">先减少互相矛盾的状态</a><a href="#把校验和状态变换写成纯函数" class="toc-level-2">把校验和状态变换写成纯函数</a><a href="#类组件只负责连接事件与副作用" class="toc-level-2">类组件只负责连接事件与副作用</a><a href="#服务端错误不要变成不可恢复的提示" class="toc-level-2">服务端错误不要变成不可恢复的提示</a><a href="#把事件协议写进协作约定" class="toc-level-2">把事件协议写进协作约定</a><a href="#测试转换规则再补浏览器交互" class="toc-level-2">测试转换规则，再补浏览器交互</a><a href="#结论" class="toc-level-2">结论</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="react-effect-races"><div class="post-meta"><span class="note-year">2019 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/react-effect-races/">Hooks中的旧闭包与请求竞态：让Effect拥有清理责任</a></h3><p>通过搜索结果乱序返回分析闭包、依赖、结果归属与清理，构造可控 Promise 验证旧请求不会覆盖当前选择。</p><div class="post-bottom"><div class="tags"><span>React</span><span>JavaScript</span><span>Frontend</span><span>Concurrency</span></div><a class="icon-link" href="/zh/blog/react-effect-races/" aria-label="阅读全文: Hooks中的旧闭包与请求竞态：让Effect拥有清理责任"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="react19-action-recovery"><div class="post-meta"><span class="note-year">2024 · 技术回顾</span><span>8 分钟阅读</span></div><h3><a href="/zh/blog/react19-action-recovery/">React19表单交互：乐观更新、失败恢复与服务端约定</a></h3><p>利用 Actions、useActionState 和 useOptimistic 表达提交过程，同时保留草稿、区分未知结果与业务冲突，并用稳定操作键控制失败后的重试。</p><div class="post-bottom"><div class="tags"><span>React</span><span>Frontend</span><span>API</span><span>Reliability</span></div><a class="icon-link" href="/zh/blog/react19-action-recovery/" aria-label="阅读全文: React19表单交互：乐观更新、失败恢复与服务端约定"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>

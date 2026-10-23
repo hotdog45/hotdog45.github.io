@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>可重跑的Python自动化：断点、去重与失败账本 — Xiaofeng Qiao</title><meta name="description" content="让批处理绑定输入快照，以稳定工作键恢复进度，隔离坏行并对账每个终态，而不是靠行号继续跑。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/python-replayable-automation/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/python-replayable-automation/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="可重跑的Python自动化：断点、去重与失败账本 — Xiaofeng Qiao"><meta property="og:description" content="让批处理绑定输入快照，以稳定工作键恢复进度，隔离坏行并对账每个终态，而不是靠行号继续跑。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2021 · 技术回顾</span><span>6 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">可重跑的Python自动化：断点、去重与失败账本</h1><p class="article-deck" itemprop="description">让批处理绑定输入快照，以稳定工作键恢复进度，隔离坏行并对账每个终态，而不是靠行号继续跑。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="跑到第八十行不代表下次从第八十一行继续">跑到第八十行，不代表下次从第八十一行继续</h2>
+<p>批量转换报表、整理资料或导入记录时，第一次成功并不难。真正的问题是：运行到第八十项退出后，输入文件又被别人插入了一行。保存下来的行号还有效吗？之前失败的三条记录，会不会被新一轮“完成数量”掩盖？</p>
+<p>本文以2021年的Python3.9能力为回顾基线，讨论一份批处理怎样拥有可以对账的恢复过程。配套使用模拟CSV与临时SQLite数据库，2026年在Python3.9.6、SQLite3.54.0上实际运行；这个SQLite版本是复现环境，不代表当年的版本。</p>
+<h2 id="先冻结本次要处理的集合">先冻结本次要处理的集合</h2>
+<p>脚本开始前，应把输入变成一个明确的批次：保存原始内容快照、内容摘要和格式版本。配套将原始CSV字节与SHA-256摘要存进manifest表，之后恢复前重新计算源文件摘要，不一致就停止，而不是默默接受新增行。</p>
+<pre><code class="language-python">raw = Path(source).read_bytes()
+digest = hashlib.sha256(raw).hexdigest()
+previous = db.execute(
+    &quot;SELECT digest FROM manifest WHERE id=1&quot;
+).fetchone()
+if previous and previous[0] != digest:
+    raise ValueError(&quot;source changed; review the difference&quot;)
+</code></pre>
+<p>示例采用严格的字节级比较，连换行变化也会被识别。它简单但保守；若业务希望允许等价格式变化，可以建立版本化的规范化规则，不能在恢复时临时忽略差异。源文件有意更新时，应创建新批次或审阅差异后迁移状态，保留旧清单，不覆盖原始证据。</p>
+<p>快照也不能随便保存敏感原文。实际输入包含个人资料时，需要限制访问与保留期限；摘要不是匿名化手段。本文只保存虚构工作键和数量。</p>
+<h2 id="工作键跟着业务行号只负责定位错误">工作键跟着业务，行号只负责定位错误</h2>
+<p>有效记录使用稳定job_id标识，而不是当前行号。文件排序变化不应该把同一项工作变成另一项；同一个工作键对应不同输入，则应报冲突，不能覆盖旧结果。</p>
+<p>配套在执行前统计所有工作键。同批次出现重复键时，两条重复记录都拒绝，避免“第一条先写入、第二条才发现重复”产生顺序相关结果。行号仍有用途：缺少工作键的坏行只能以快照中的位置定位，但它不会获得一个可以执行的业务身份。</p>
+<p>对于CSV，还要先验证表头、缺列和多余列，再检查数量的整数范围。不能因为某行转成字典，就认为格式已经正确。Python官方提供DictReader，但具体必填字段和业务类型仍需要程序负责。<a href="https://docs.python.org/3.9/library/csv.html" rel="noopener noreferrer">csv文档</a></p>
+<h2 id="坏行要隔离不能让好行全部重做">坏行要隔离，不能让好行全部重做</h2>
+<p>配套把输入分为合法工作、确定性拒绝和暂时失败。非法数量、重复键和缺字段属于拒绝，不自动重试；依赖暂时失败则进入可重试账本，继续处理其他独立记录。</p>
+<pre><code class="language-python">try:
+    quantity = int(row.get(&quot;quantity&quot;) or &quot;&quot;)
+    if not 0 &lt;= quantity &lt;= 2**63 - 1:
+        raise ValueError(&quot;quantity outside SQLite integer range&quot;)
+except (ValueError, TypeError) as error:
+    db.execute(
+        &quot;INSERT INTO failures(record_key,kind,reason) VALUES (?,?,?)&quot;,
+        (&quot;line:&quot; + str(line), &quot;rejected&quot;, str(error)),
+    )
+    counts[&quot;rejected&quot;] += 1
+    continue
+</code></pre>
+<p>完整实现还有结构和重复键检查。错误账本保留工作位置、错误分类和诊断，不把整个输入行、密钥或用户正文直接拼进日志。再次执行可以追加尝试记录，避免覆盖第一次失败原因；汇总时则以当前状态为准，不能把历史失败次数算成当前失败项数。</p>
+<p>隔离也有前提：单项必须可以独立验收。若文件前半段定义了后半段所依赖的统一配置，继续运行可能扩大错误，应提升为批次级失败。哪些错误可以跳过，需要由业务约定。</p>
+<h2 id="成功回执只是恢复基础不是整批状态">成功回执只是恢复基础，不是整批状态</h2>
+<p>每个合法工作仍需要可靠的成功边界。示例的本地处理器把outputs和receipts放在同一SQLite事务，回执包含稳定键、输入摘要和结果。同键同输入读回旧结果，不重复写入；同键不同输入报冲突。这一小段基础用于让批次恢复能够信任“已经完成”的工作。</p>
+<p>数据库连接使用显式事务控制，写入采用参数绑定。SQLite只有一个同时进行的写事务，批次过大时应考虑锁持有时间，而不把长时间解析和无关计算放在事务内。<a href="https://docs.python.org/3.9/library/sqlite3.html" rel="noopener noreferrer">Python sqlite3</a>、<a href="https://www.sqlite.org/lang_transaction.html" rel="noopener noreferrer">SQLite事务</a></p>
+<p>本文不把本地事务推广为远端API的恰好执行一次保证。脚本的外部副作用需要另外的查询、幂等和未知结果处理；当前示例没有任何外部调用。</p>
+<h2 id="恢复时重新对账不依赖一个乐观的游标">恢复时重新对账，不依赖一个乐观的游标</h2>
+<p>主循环对照冻结清单逐项读取回执。一次进程中断后，已经提交的工作被标为replayed，尚未执行的工作继续处理。输入没有变化，稳定工作键和回执就能定位进度，不必相信“上次大概到第几行”。</p>
+<p>配套报告将done、rejected、retryable、pending与输入总行数对账。replayed是done的子集，不能再加一次。示例中三行输入有两项成功、一行坏数据，报告应是done2、rejected1、total3，而不是把“处理了三行”写成三项业务成功。</p>
+<p>这里还区分两个结束判断：all_rows_terminal表示每行已经成功或明确拒绝，没有暂时失败；batch_complete则要求所有行成功。坏行被分类处理后，前者可以成立，后者仍为false。命名上的区别，会影响操作人员是否继续检查异常。</p>
+<h2 id="用中断和输入变化验证恢复协议">用中断和输入变化验证恢复协议</h2>
+<p>配套含十项测试，五项检验单项回执，五项检验批次：</p>
+<ul>
+<li>坏行进入账本，其他行正常完成。</li>
+<li>第一项提交后注入中断，重跑只恢复剩余工作。</li>
+<li>修改源文件后拒绝继续，既有结果没有增加。</li>
+<li>重复业务键全部被拒绝，不依赖文件顺序。</li>
+<li>暂时失败时不声称完整成功，恢复后仍保留坏行的待审状态。</li>
+</ul>
+<pre><code class="language-bash">python3 -m unittest -v
+</code></pre>
+<p>测试在本机通过，数据全部位于自动清理的临时目录。异常注入不等于断电实验，单操作员执行也不等于已经验证多进程竞争。磁盘满、数据库备份恢复和并发调度需要在目标环境补测；Python3.9已结束维护，新项目应选择仍受支持的解释器。</p>
+<h2 id="自动化的质量体现在第二次运行">自动化的质量，体现在第二次运行</h2>
+<p>可靠脚本应该能解释本次输入是什么、每项工作的身份是什么、失败能否重试，以及剩余哪些内容尚未完成。输入快照稳定了分母，工作键稳定了身份，失败账本保留了恢复线索。只有这三者与成功回执结合，重新运行才是可审查的继续，而不是再赌一次。</p>
+<h2 id="参考与配套">参考与配套</h2>
+<ul>
+<li><a href="https://docs.python.org/3.9/library/csv.html" rel="noopener noreferrer">Python3.9 csv</a>：结构化CSV读取。</li>
+<li><a href="https://docs.python.org/3.9/library/sqlite3.html" rel="noopener noreferrer">Python3.9 sqlite3</a>：参数绑定与事务接口。</li>
+<li><a href="https://www.sqlite.org/lang_transaction.html" rel="noopener noreferrer">SQLite Transaction</a>：本地事务及写入竞争。</li>
+<li><code>examples/python-replay/batch.py</code>、<code>test_batch.py</code>和单项处理器，构成完整可运行示例。没有外部API或生产数据。</li>
+</ul>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2021/">2021 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/python/"># Python</a><a href="/zh/blog/tags/automation/"># Automation</a><a href="/zh/blog/tags/sqlite/"># SQLite</a><a href="/zh/blog/tags/testing/"># Testing</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#跑到第八十行不代表下次从第八十一行继续" class="toc-level-2">跑到第八十行，不代表下次从第八十一行继续</a><a href="#先冻结本次要处理的集合" class="toc-level-2">先冻结本次要处理的集合</a><a href="#工作键跟着业务行号只负责定位错误" class="toc-level-2">工作键跟着业务，行号只负责定位错误</a><a href="#坏行要隔离不能让好行全部重做" class="toc-level-2">坏行要隔离，不能让好行全部重做</a><a href="#成功回执只是恢复基础不是整批状态" class="toc-level-2">成功回执只是恢复基础，不是整批状态</a><a href="#恢复时重新对账不依赖一个乐观的游标" class="toc-level-2">恢复时重新对账，不依赖一个乐观的游标</a><a href="#用中断和输入变化验证恢复协议" class="toc-level-2">用中断和输入变化验证恢复协议</a><a href="#自动化的质量体现在第二次运行" class="toc-level-2">自动化的质量，体现在第二次运行</a><a href="#参考与配套" class="toc-level-2">参考与配套</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="cicd-release-rollback"><div class="post-meta"><span class="note-year">2021 · 技术回顾</span><span>6 分钟阅读</span></div><h3><a href="/zh/blog/cicd-release-rollback/">CI/CD可回退发布：构建产物、配置校验与验收门槛</a></h3><p>围绕同一份不可变产物建立验证链，区分构建成功、发布切换、业务验收和可安全回退的范围。</p><div class="post-bottom"><div class="tags"><span>CICD</span><span>Deployment</span><span>Testing</span><span>Python</span></div><a class="icon-link" href="/zh/blog/cicd-release-rollback/" aria-label="阅读全文: CI/CD可回退发布：构建产物、配置校验与验收门槛"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="flutter-frame-profiling"><div class="post-meta"><span class="note-year">2022 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/flutter-frame-profiling/">Flutter卡顿定位：用帧时间和对照实验替代猜测</a></h3><p>区分UI与Raster阶段，正确处理刷新率、分位数和流水线统计，再用受控实验判断优化是否真正有效。</p><div class="post-bottom"><div class="tags"><span>Flutter</span><span>Dart</span><span>Performance</span><span>Testing</span></div><a class="icon-link" href="/zh/blog/flutter-frame-profiling/" aria-label="阅读全文: Flutter卡顿定位：用帧时间和对照实验替代猜测"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>

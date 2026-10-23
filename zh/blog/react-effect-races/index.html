@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hooks中的旧闭包与请求竞态：让Effect拥有清理责任 — Xiaofeng Qiao</title><meta name="description" content="通过搜索结果乱序返回分析闭包、依赖、结果归属与清理，构造可控 Promise 验证旧请求不会覆盖当前选择。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/react-effect-races/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/react-effect-races/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="Hooks中的旧闭包与请求竞态：让Effect拥有清理责任 — Xiaofeng Qiao"><meta property="og:description" content="通过搜索结果乱序返回分析闭包、依赖、结果归属与清理，构造可控 Promise 验证旧请求不会覆盖当前选择。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2019 · 技术回顾</span><span>7 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">Hooks中的旧闭包与请求竞态：让Effect拥有清理责任</h1><p class="article-deck" itemprop="description">通过搜索结果乱序返回分析闭包、依赖、结果归属与清理，构造可控 Promise 验证旧请求不会覆盖当前选择。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="最后返回的请求不一定属于最后一次选择">最后返回的请求，不一定属于最后一次选择</h2>
+<p>用户先点开 A 商品，随后切换到 B。B 请求很快返回，页面显示 B；稍后 A 请求才完成，又把内容覆盖成 A。页面标题来自当前选择，详情却来自旧请求，单看每次网络调用都没有报错。</p>
+<p>本文以 React 16.8 稳定引入 Hooks 的 2019 年为回顾起点，用独立分析示例解释异步结果归属。代码只使用 <code>useState</code>、<code>useEffect</code> 等该时期已有的接口，行为模型在今天的 Node.js 16.16.0 运行。当前 React 文档中的后续 API 与开发模式检查不会被当作 2019 年已有的默认行为。<a href="https://legacy.reactjs.org/blog/2019/02/06/react-v16.8.0.html" rel="noopener noreferrer">React 16.8 发布记录</a></p>
+<h2 id="闭包保存的是一次渲染所看到的值">闭包保存的是一次渲染所看到的值</h2>
+<p>函数在一次渲染中创建，引用的状态和参数也属于那次渲染。一个只在首次建立的定时器，如果回调持续使用当时的 <code>count</code>，就不会因为界面重新渲染而自动换成新值。这不是“React 忘了刷新变量”，而是 JavaScript 闭包与 React 渲染模型共同产生的结果。</p>
+<p>如果更新只依赖前一个计数值，可以采用 <code>setCount(previous =&gt; previous + 1)</code>。但这不能替代所有依赖：回调若还读取当前房间、筛选条件或权限，仍需决定何时重新建立外部连接。把依赖数组随意改成空数组，只是让过期引用不再明显地重新执行，并没有使它变正确。<a href="https://legacy.reactjs.org/docs/hooks-effect.html" rel="noopener noreferrer">旧版 Effect 使用说明</a></p>
+<p>对商品查询，更直接的不变量是：只有仍然属于当前那次 Effect 的结果可以更新页面。旧请求可以完成，但失去修改当前界面的资格。把“能否更新 UI”与“能否真正终止远端工作”分开，设计会清楚许多。</p>
+<h2 id="让每次-effect-拥有自己的结果许可">让每次 Effect 拥有自己的结果许可</h2>
+<p>先把异步操作抽成一个小函数，返回清理动作：</p>
+<pre><code class="language-javascript">function beginLoad(id, load, publish) {
+  let active = true;
+  publish({ id, status: 'loading', data: null, error: null });
+  const done = Promise.resolve().then(() =&gt; load(id)).then(
+    data =&gt; {
+      if (active) publish({ id, status: 'success', data, error: null });
+    },
+    () =&gt; {
+      if (active) publish({ id, status: 'error', data: null, error: 'load_failed' });
+    }
+  );
+  return {
+    done,
+    cleanup() { active = false; }
+  };
+}
+</code></pre>
+<p><code>Promise.resolve().then(() =&gt; load(id))</code> 也会把加载函数的同步抛错送进失败分支。错误显示使用公开的错误码，而不是把接口堆栈直接写进页面。清理后，成功与失败分支都检查许可；不能只挡住成功回调，却让旧请求的错误提示盖住新页面。</p>
+<p>在 Hook 中连接它：</p>
+<pre><code class="language-javascript">import { useEffect, useState } from 'react';
+
+function useResource(id, load) {
+  const [state, setState] = useState({
+    id, status: 'loading', data: null, error: null
+  });
+  useEffect(() =&gt; {
+    const operation = beginLoad(id, load, setState);
+    return operation.cleanup;
+  }, [id, load]);
+  return state.id === id ? state : {
+    id, status: 'loading', data: null, error: null
+  };
+}
+</code></pre>
+<p>这里假定 <code>id</code> 是已校验的非空资源请求键，完整区分资源及其业务作用域，<code>load</code> 返回该键对应的数据或拒绝 Promise。<code>load</code> 应放在组件外，或用合适的 <code>useCallback</code> 维持身份；在每次渲染里创建新函数，再作为依赖传进来，会使 Effect 不断重新建立。正确做法是调整数据流和函数边界，而不是删掉真实依赖压住症状。<a href="https://react.dev/reference/react/useEffect#specifying-reactive-dependencies" rel="noopener noreferrer">当前 useEffect 依赖说明</a></p>
+<p>返回前的 <code>state.id === id</code> 也有作用。选择已变成 B 时，新 Effect 尚未运行的那次渲染仍可能保存 A 的旧状态；直接把它画出来，会短暂显示错配数据。把状态绑定到资源标识，可以在这一阶段先展示加载态。若产品希望保留旧数据作为过渡，应明确标记正在刷新，而不是让旧详情看起来属于 B。</p>
+<h2 id="清理不是一键取消所有副作用">清理不是一键取消所有副作用</h2>
+<p>依赖变化后，React 会先清理旧 Effect，再执行新的建立逻辑；组件移除时也会清理。因此局部许可可以把一段外部同步工作限制在它对应的生命周期内。<a href="https://react.dev/reference/react/useEffect#reference" rel="noopener noreferrer">useEffect 建立与清理顺序</a></p>
+<p>这个例子没有取消网络请求，只是丢弃已经失去归属的结果。实际 <code>fetch</code> 可以结合受支持环境中的取消机制节约资源，但请求已经到达服务端后，取消客户端等待不等于回滚服务端操作。查询与写入也不同：保存订单不应仅由某个渲染 Effect 隐式触发，否则重新建立同步过程就可能重复产生业务副作用。</p>
+<p>订阅还需要对称地解除订阅，定时器需要清除定时器。不能因为已经加了 <code>active</code> 布尔值，就忘记释放持续占用资源的连接。结果忽略负责 UI 正确性，资源清理负责生命周期，两者相关但并不互相替代。</p>
+<h2 id="用可控-promise-制造坏顺序">用可控 Promise 制造坏顺序</h2>
+<p>只用一个立即返回的 mock，几乎一定测不出竞态。应让测试自己控制 A、B 请求何时完成：先启动 A，清理 A，再启动 B；先完成 B，最后才完成 A。最终界面状态仍必须属于 B。</p>
+<p>随稿 <code>examples/effect_races.mjs</code> 已在 Node.js 16.16.0 完成七组检查：旧成功结果被忽略、只有当前请求发布成功、资源标识不匹配时显示加载、匹配时保留数据、清理后旧失败不再更新、同步异常进入失败分支、失败输出使用公开错误码。没有定时等待或真实请求，执行顺序由 Promise 控制，重复运行结果可预测。</p>
+<p>这不是 React 渲染器集成测试，也没有验证浏览器取消请求、Suspense 或框架的数据缓存。接入实际组件后，还要检查快速切换、卸载、重新挂载和相同资源多次刷新。当前 Strict Mode 会增加开发期的 Effect 检查，适合暴露不对称清理；这是今天调试时的补充，不能据此解释为 2019 年所有版本都会执行同样检查。<a href="https://react.dev/reference/react/StrictMode" rel="noopener noreferrer">当前 Strict Mode 文档</a></p>
+<h2 id="请求身份比商品编号更完整">请求身份比商品编号更完整</h2>
+<p>两个租户可能拥有相同的商品编号，权限切换后同一个地址也可能返回不同内容。因此请求键不一定只是数据库主键，还可能需要租户、语言和权限版本。若用户身份改变而键完全不变，旧数据就可能在新 Effect 启动之前被继续展示。应在上层把真正影响结果归属的作用域纳入请求身份，并在权限失效时撤销对应数据；不要把访问令牌明文拼进可记录或持久化的键。</p>
+<p>当依赖修正导致频繁重连，也要检查是不是把多份职责塞进了一个 Effect。例如数据订阅负责连接生命周期，界面上的排序可以由当前数据直接推导；为了改变排序就断开重连，会放大网络负担。定时回调只需要累积消息时，可以通过函数式状态更新读取前值，但连接到哪个租户和房间仍需明确依赖。减少不必要的外部同步，与隐瞒真实依赖，是两种完全不同的修改。</p>
+<h2 id="数据获取方案也有边界">数据获取方案也有边界</h2>
+<p>这个小 Hook 适合说明结果归属，不具备跨组件去重、缓存失效、预加载或服务器渲染的数据协调能力。当多处页面读取同一资源，继续堆局部 Effect 容易出现重复请求和瀑布等待。可以选择成熟的数据层或框架加载机制，但仍应验证它如何定义请求键、权限变化与旧结果失效，不能只把问题交给库名。</p>
+<h2 id="结论">结论</h2>
+<p>处理 Hooks 竞态，先回答“结果现在属于谁”。依赖描述何时需要重新同步，清理撤销旧同步的许可，资源标识决定当前渲染能展示什么。把这三层约定拆开，再主动制造乱序结果，就能用可复现的证据判断修复是否成立。</p>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2019/">2019 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/react/"># React</a><a href="/zh/blog/tags/javascript/"># JavaScript</a><a href="/zh/blog/tags/frontend/"># Frontend</a><a href="/zh/blog/tags/concurrency/"># Concurrency</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#最后返回的请求不一定属于最后一次选择" class="toc-level-2">最后返回的请求，不一定属于最后一次选择</a><a href="#闭包保存的是一次渲染所看到的值" class="toc-level-2">闭包保存的是一次渲染所看到的值</a><a href="#让每次-effect-拥有自己的结果许可" class="toc-level-2">让每次 Effect 拥有自己的结果许可</a><a href="#清理不是一键取消所有副作用" class="toc-level-2">清理不是一键取消所有副作用</a><a href="#用可控-promise-制造坏顺序" class="toc-level-2">用可控 Promise 制造坏顺序</a><a href="#请求身份比商品编号更完整" class="toc-level-2">请求身份比商品编号更完整</a><a href="#数据获取方案也有边界" class="toc-level-2">数据获取方案也有边界</a><a href="#结论" class="toc-level-2">结论</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="react-form-state"><div class="post-meta"><span class="note-year">2017 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/react-form-state/">React复杂表单：单向数据流与可测试的状态转换</a></h3><p>从错误提示、重复提交和异步结果覆盖出发，将类组件表单拆成纯状态转换与副作用适配，保留用户输入并验证失败恢复。</p><div class="post-bottom"><div class="tags"><span>React</span><span>JavaScript</span><span>Frontend</span><span>Testing</span></div><a class="icon-link" href="/zh/blog/react-form-state/" aria-label="阅读全文: React复杂表单：单向数据流与可测试的状态转换"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="react19-action-recovery"><div class="post-meta"><span class="note-year">2024 · 技术回顾</span><span>8 分钟阅读</span></div><h3><a href="/zh/blog/react19-action-recovery/">React19表单交互：乐观更新、失败恢复与服务端约定</a></h3><p>利用 Actions、useActionState 和 useOptimistic 表达提交过程，同时保留草稿、区分未知结果与业务冲突，并用稳定操作键控制失败后的重试。</p><div class="post-bottom"><div class="tags"><span>React</span><span>Frontend</span><span>API</span><span>Reliability</span></div><a class="icon-link" href="/zh/blog/react19-action-recovery/" aria-label="阅读全文: React19表单交互：乐观更新、失败恢复与服务端约定"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>

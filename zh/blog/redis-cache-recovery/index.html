@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>缓存失效后的高峰：Redis回源、过期抖动与故障降级 — Xiaofeng Qiao</title><meta name="description" content="分析热点失效时的回源放大、刷新租约过期与旧值覆盖，使用所有者令牌和原子发布限定刷新资格，并明确陈旧数据与数据库一致性的边界。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/redis-cache-recovery/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/redis-cache-recovery/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="缓存失效后的高峰：Redis回源、过期抖动与故障降级 — Xiaofeng Qiao"><meta property="og:description" content="分析热点失效时的回源放大、刷新租约过期与旧值覆盖，使用所有者令牌和原子发布限定刷新资格，并明确陈旧数据与数据库一致性的边界。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2020 · 技术回顾</span><span>7 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">缓存失效后的高峰：Redis回源、过期抖动与故障降级</h1><p class="article-deck" itemprop="description">分析热点失效时的回源放大、刷新租约过期与旧值覆盖，使用所有者令牌和原子发布限定刷新资格，并明确陈旧数据与数据库一致性的边界。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="命中率很高失效时仍可能压垮数据库">命中率很高，失效时仍可能压垮数据库</h2>
+<p>一个热门商品平时几乎全部命中缓存。键过期的瞬间，大量请求同时发现未命中，一起访问数据库。此时平均命中率可能仍然很好看，数据库连接池却被短时间挤满；继续增加缓存容量，对这一波回源并没有直接帮助。</p>
+<p>本文以 2020 年 Redis 6 时代的缓存设计为回顾视角，使用独立分析示例。方案只依赖此前已有的 <code>SET NX PX</code> 和 Lua 脚本，不使用后续版本才增加的条件选项。官方命令页提供选项历史，当前页面出现的新参数不能直接当作 Redis 6 可用能力。<a href="https://redis.io/docs/latest/commands/set/" rel="noopener noreferrer">SET 参数与版本历史</a></p>
+<h2 id="先约定哪些旧数据可以继续服务">先约定哪些旧数据可以继续服务</h2>
+<p>缓存不是数据库的另一种写法，它是允许一定失效窗口的读模型。商品介绍可以容忍短时间陈旧，账户权限撤销、最终库存扣减等判断却未必可以。先给数据分类，决定允许返回多久以前的值，再讨论缓存策略。</p>
+<p>可以把新鲜期限与最长可用期限分开：新鲜期内直接返回；超过新鲜期但尚未到硬期限时，允许一个刷新者回源，其余请求返回明确允许的旧值；硬期限之后不能继续伪装成有效数据。若没有旧值，失败请求应受到并发上限和等待预算约束，而不是全部绕过缓存冲向数据库。</p>
+<p>物理 TTL 负责最终淘汰，值中的新鲜期限负责应用判断，两者不能混淆。TTL 到期的键不能被当成仍可读取的旧值；想在刷新期间使用旧值，就需要让物理保留期覆盖允许的陈旧窗口。<a href="https://redis.io/docs/latest/commands/expire/" rel="noopener noreferrer">Redis 过期语义</a></p>
+<h2 id="一个刷新者并不意味着它永远拥有资格">一个刷新者，并不意味着它永远拥有资格</h2>
+<p>对同一个缓存键，用独立刷新锁争取回源资格：</p>
+<pre><code class="language-text">SET {product:demo}:refresh unique-owner-token NX PX 500
+</code></pre>
+<p>成功者在受控的回源并发池中读取数据；失败者按策略返回旧值、短暂等待后重读，或者返回可重试的繁忙结果。令牌必须由每次刷新生成，不能复用进程名或固定字符串。锁的 TTL 让刷新者崩溃后能够恢复，但也意味着它只是有期限的租约。</p>
+<p>假设 A 拿锁后卡住，五百毫秒后锁过期，B 获得新令牌并完成刷新。A 此时恢复，如果直接 <code>SET</code> 缓存，会把 B 的新结果覆盖成旧结果；如果直接 <code>DEL</code> 锁，还会删掉 B 的资格。因此比较所有者不能只发生在解锁时，也要发生在发布结果时。官方分布式锁文档对唯一令牌和租期假设有详细讨论；这里仅把锁用于减少重复刷新，不用它代替严格的业务一致性机制。<a href="https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/" rel="noopener noreferrer">刷新租约的适用边界</a></p>
+<h2 id="把资格检查和缓存发布合成一步">把资格检查和缓存发布合成一步</h2>
+<p>下列脚本只允许当前所有者发布。先检查参数，再读取锁、写缓存并删除锁，避免在客户端分成多条命令留下竞态窗口：</p>
+<pre><code class="language-lua">-- KEYS[1] 刷新锁，KEYS[2] 缓存值
+-- ARGV[1] 所有者令牌，ARGV[2] 序列化结果，ARGV[3] TTL毫秒
+local ttl = tonumber(ARGV[3])
+if not ttl or ttl &lt;= 0 or ttl ~= math.floor(ttl) then
+  return redis.error_reply('invalid cache TTL')
+end
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+redis.call('SET', KEYS[2], ARGV[2], 'PX', ttl)
+redis.call('DEL', KEYS[1])
+return 1
+</code></pre>
+<p>Redis 脚本执行期间不会与其他客户端命令交错，所以适合这种短小的条件更新；脚本也会阻塞其他工作，不应该把长循环或网络回源塞进去。原子执行不等于数据库式的异常自动回滚，应在首次写入前校验输入，控制后续命令的失败条件。集群模式还要确保脚本访问的键落在同一槽位，示例的共同 hash tag 用于表达这一要求，实际拓扑仍需测试。<a href="https://redis.io/docs/latest/develop/programmability/eval-intro/" rel="noopener noreferrer">Lua 脚本执行模型</a></p>
+<p>返回零表示刷新资格已经丢失，调用方应丢弃本次结果并重读缓存，不能换一个分支继续无条件写入。监控中也应区分“源读取成功”与“缓存发布成功”；如果只统计前者，会掩盖大量超租期工作。</p>
+<h2 id="刷新锁不能解决所有旧值回写">刷新锁不能解决所有旧值回写</h2>
+<p>还有另一种顺序：刷新者读取数据库旧版本，随后写请求更新数据库并删除缓存，刷新者最后才发布旧值。即使租约一直有效，也没有阻止这个顺序，因为数据库写入方没有参与同一份资格协议。</p>
+<p>可以按业务需求选择带版本的缓存条目、写入事件驱动的失效协议，或明确接受一个有上限的陈旧窗口。无论哪种方案，都要验证写入与回源交错的情况。把缓存锁称为“分布式一致性已经解决”，会把真正的问题藏起来；最终扣库存仍应由数据库或专门的业务约束决定。</p>
+<h2 id="批量过期空值和故障要分开处理">批量过期、空值和故障要分开处理</h2>
+<p>一批键在整点一起过期，会制造回源尖峰。为 TTL 增加有限随机抖动可以分散失效时间，但应在写入时确定，而不是每次读取时续期，让键永远不过期。抖动范围要服从业务允许的陈旧时间，不能为了平滑流量把错误数据多留很久。</p>
+<p>不存在的数据可以短暂缓存“未找到”，但要区分稳定不存在、权限不足和源服务故障。把数据库超时写成“商品不存在”，会把暂时故障变成持续的业务错误；把一个租户的权限失败缓存给另一个租户，则是键作用域设计错误。</p>
+<p>Redis 整体不可用时，不应让所有实例同时无上限直连数据库。应使用回源并发闸门、超时预算和可解释的降级响应；恢复后也要逐步建立热键，避免所有实例同时预热。命中率之外，至少观察回源并发、等待时间、旧值年龄、发布被拒次数和错误分类，才能看见策略有没有真正保护源服务。</p>
+<h2 id="验证租约失效的坏顺序">验证租约失效的坏顺序</h2>
+<p><code>examples/cache_refresh_model.mjs</code> 使用可手动推进的时钟，已在 Node.js 16.16.0 完成八组行为检查：二十个竞争者只有一个获得资格、租期后新所有者接管、旧所有者不能解锁、旧结果不能发布、当前所有者可发布、读取新值、硬期限到期失效，以及 TTL 抖动范围。测试不依赖真实计时，便于稳定复现 A 慢、B 快的顺序。</p>
+<p>本次未安装或连接 Redis，也没有执行 Lua 或故障切换实验；模型中的一步条件发布只是模拟脚本的设计意图。接入真实 Redis 之后，还要测试脚本输入错误、客户端超时后结果不确定、集群槽位、连接中断与主从切换。单实例模型不能证明故障切换后的互斥保证，文章也不作这一承诺。</p>
+<h2 id="结论">结论</h2>
+<p>缓存恢复策略应先限制失败时的额外工作，再提高成功时的命中率。有限租约决定谁可以刷新，原子发布防止过期刷新者覆盖结果，硬期限约束旧值使用；数据库写入一致性与故障切换仍有各自的协议。把这些边界分开验证，缓存才能在最需要它的时候减少压力。</p>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2020/">2020 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/redis/"># Redis</a><a href="/zh/blog/tags/cache/"># Cache</a><a href="/zh/blog/tags/backend/"># Backend</a><a href="/zh/blog/tags/reliability/"># Reliability</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#命中率很高失效时仍可能压垮数据库" class="toc-level-2">命中率很高，失效时仍可能压垮数据库</a><a href="#先约定哪些旧数据可以继续服务" class="toc-level-2">先约定哪些旧数据可以继续服务</a><a href="#一个刷新者并不意味着它永远拥有资格" class="toc-level-2">一个刷新者，并不意味着它永远拥有资格</a><a href="#把资格检查和缓存发布合成一步" class="toc-level-2">把资格检查和缓存发布合成一步</a><a href="#刷新锁不能解决所有旧值回写" class="toc-level-2">刷新锁不能解决所有旧值回写</a><a href="#批量过期空值和故障要分开处理" class="toc-level-2">批量过期、空值和故障要分开处理</a><a href="#验证租约失效的坏顺序" class="toc-level-2">验证租约失效的坏顺序</a><a href="#结论" class="toc-level-2">结论</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="tracing-timeout-budget"><div class="post-meta"><span class="note-year">2022 · 技术回顾</span><span>6 分钟阅读</span></div><h3><a href="/zh/blog/tracing-timeout-budget/">跨服务调用为什么慢：trace、超时预算与错误关联</a></h3><p>从排队、并行调用和超时重置分析跨服务延迟，把链路上下文、剩余预算与错误分类分开设计，并用确定性模型验证截止时间不会被下游延长。</p><div class="post-bottom"><div class="tags"><span>API</span><span>OpenTelemetry</span><span>Backend</span><span>Reliability</span></div><a class="icon-link" href="/zh/blog/tracing-timeout-budget/" aria-label="阅读全文: 跨服务调用为什么慢：trace、超时预算与错误关联"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="web3-event-reconciliation"><div class="post-meta"><span class="note-year">2025 · 技术回顾</span><span>6 分钟阅读</span></div><h3><a href="/zh/blog/web3-event-reconciliation/">Web3 交易状态设计：从钱包确认到链上事件对账</a></h3><p>把登录签名、交易提交、区块确认与业务入账分开设计，讨论账户切换、日志去重、链重组和金额精度，避免把一个交易哈希误当成最终成功。</p><div class="post-bottom"><div class="tags"><span>Web3</span><span>TypeScript</span><span>Backend</span><span>Reliability</span></div><a class="icon-link" href="/zh/blog/web3-event-reconciliation/" aria-label="阅读全文: Web3 交易状态设计：从钱包确认到链上事件对账"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>

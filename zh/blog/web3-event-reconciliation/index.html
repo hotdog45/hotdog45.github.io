@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Web3 交易状态设计：从钱包确认到链上事件对账 — Xiaofeng Qiao</title><meta name="description" content="把登录签名、交易提交、区块确认与业务入账分开设计，讨论账户切换、日志去重、链重组和金额精度，避免把一个交易哈希误当成最终成功。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/web3-event-reconciliation/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/web3-event-reconciliation/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="Web3 交易状态设计：从钱包确认到链上事件对账 — Xiaofeng Qiao"><meta property="og:description" content="把登录签名、交易提交、区块确认与业务入账分开设计，讨论账户切换、日志去重、链重组和金额精度，避免把一个交易哈希误当成最终成功。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2025 · 技术回顾</span><span>6 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">Web3 交易状态设计：从钱包确认到链上事件对账</h1><p class="article-deck" itemprop="description">把登录签名、交易提交、区块确认与业务入账分开设计，讨论账户切换、日志去重、链重组和金额精度，避免把一个交易哈希误当成最终成功。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="钱包弹窗关闭之后业务才刚开始">钱包弹窗关闭之后，业务才刚开始</h2>
+<p>用户点击确认，页面拿到交易哈希，随后显示“操作成功”。几秒后查询 receipt 发现执行失败；另一次 receipt 成功，服务端却没有识别到预期事件。两种情况下，“拿到 hash”都是真的，“业务已经完成”却都没有依据。</p>
+<p>Web3 应用的难点之一，是让钱包、链节点、索引服务和业务页面对同一次操作使用一致的语言。这里按 2025 年的技术阶段讨论 EVM 应用状态设计，结合本站 ChainScope 的合成事件场景展开，不涉及真实钱包、资金或主网操作。</p>
+<h2 id="连接钱包与登录会话要分别失效">连接钱包与登录会话要分别失效</h2>
+<p>连接钱包表示应用可以通过 provider 与某条链交互，不等于服务端已经识别用户。登录签名用于证明某个地址在特定上下文中的控制权；交易签名则授权一项链上操作，两者不能共用一句模糊的“授权成功”。</p>
+<p>若采用 SIWE，服务端需要校验消息格式、域名、URI、链 ID、时效、签名及自己发出的 nonce，并原子地消费 nonce，避免并发重放。签名者若是合约账户，还需要使用适合该类账户的验证机制，而不是只做 EOA 地址恢复。<a href="https://eips.ethereum.org/EIPS/eip-4361" rel="noopener noreferrer">ERC-4361</a>给出了登录消息与验证约定。</p>
+<p>钱包切换账户后，旧页面里的草稿、查询缓存和当前会话需要重新核对；链切换后，地址相同也不能沿用另一条链的余额或合约配置。监听 <code>accountsChanged</code>、<code>chainChanged</code> 与断开事件只是入口，业务还要定义清理范围。<a href="https://eips.ethereum.org/EIPS/eip-1193" rel="noopener noreferrer">EIP-1193</a>规定了 provider 的请求与事件接口。</p>
+<h2 id="为每次操作保留三个身份">为每次操作保留三个身份</h2>
+<p>第一层是用户意图，例如一次表单提交产生的操作 ID；第二层是钱包提交后的交易哈希；第三层是链上事件的位置。它们并不是一一对应：用户可能拒绝签名，交易可能被替换，一笔交易也可能产生多个事件。</p>
+<p>业务记录可以保留以下字段：</p>
+<pre><code class="language-text">operationId
+chainId + account + contract
+transactionHash
+blockNumber + blockHash + logIndex
+observedState + updatedAt
+</code></pre>
+<p><code>operationId</code> 用来关联界面与服务端流程，不能替代链上身份；事件去重可以采用包含链 ID、区块哈希、交易哈希和日志索引的复合键，并另外维护它是否属于当前规范链。只按交易哈希去重，会把同笔交易里的第二条有效事件丢掉。</p>
+<p>接收日志时必须检查来自预期链与合约，并按匹配版本的 ABI 解码；事件名称相同不代表业务含义相同。代理合约升级后，还要知道历史事件使用哪个接口版本解释。</p>
+<h2 id="成功应该是一组可以解释的状态">成功应该是一组可以解释的状态</h2>
+<p>界面可以区分：等待钱包确认、已提交、已进入区块、达到应用确认条件、执行失败、状态待核对。服务端另行记录业务对账是否完成。不要把节点超时或暂时查不到 receipt 直接写成链上失败。</p>
+<pre><code class="language-text">用户意图 → 钱包确认 → 已提交 → 已入块 → 确认条件满足
+                    ↘ 拒绝       ↘ 执行失败
+                                     ↓
+                              事件识别 → 业务对账
+</code></pre>
+<p>receipt 的 <code>status</code> 反映交易执行结果；即使执行成功，也仍要检查预期事件及其内容。确认数是应用策略，不能当成所有链统一的最终性保证。以太坊 JSON-RPC 支持的 <code>safe</code>、<code>finalized</code> 等区块标签，与“等若干块”也不是完全相同的概念，具体支持需以目标链和节点为准。<a href="https://ethereum.org/en/developers/docs/apis/json-rpc/" rel="noopener noreferrer">JSON-RPC 参考</a>及<a href="https://ethereum.org/en/developers/docs/consensus-mechanisms/pos/" rel="noopener noreferrer">权益证明最终性说明</a>可用于核对这些术语。</p>
+<h2 id="链重组要求修正观察而不是再加一次余额">链重组要求修正观察，而不是再加一次余额</h2>
+<p>索引服务先看到了区块 A 的日志，之后同一高度变成区块 B。若只维护不断增长的确认次数，旧观察可能一直留在业务账本里。更可靠的扫描记录包括区块哈希、父哈希、检查点与一定范围的重扫。</p>
+<p>发现分叉时，找到共同祖先，把失去规范链归属的观察标记为无效，再按新链重放。原始记录宜保留，便于解释为什么撤销；派生状态则根据仍有效的事件重算。不要在业务表中直接盲目“加一再减一”，否则重复回调或重扫很容易再次改变结果。</p>
+<p>不可逆的外部动作尤其要谨慎安排。若事件触发发货，之后链上观察被撤销，数据库回滚并不能把货物收回。应用应按业务风险选择确认条件，并为异常保留人工核对入口；技术状态变更不是现实副作用的自动补偿。</p>
+<h2 id="金额的精度属于数据协议">金额的精度属于数据协议</h2>
+<p>RPC 中的整数金额应先按整数解析，再结合明确的 decimals 做显示。不要用 JavaScript <code>Number</code> 存储任意大的基础单位，也不要对所有资产写死 18 位小数。不同资产的基础单位不同，未完成单位换算前不能相加。</p>
+<pre><code class="language-js">function formatUnits(raw, decimals) {
+  if (!/^\d+$/.test(raw)) throw new Error('invalid integer')
+  if (!Number.isInteger(decimals) || decimals &lt; 0 || decimals &gt; 36)
+    throw new Error('unsupported decimals')
+  const value = BigInt(raw)
+  const scale = 10n ** BigInt(decimals)
+  if (decimals === 0) return value.toString()
+  const fraction = (value % scale).toString().padStart(decimals, '0')
+  return `${value / scale}.${fraction}`
+}
+</code></pre>
+<p>这里 0–36 是示例应用的支持范围，不是链协议对所有资产的上限。函数保持完整小数位，不处理展示舍入；产品若要只显示四位，应明确舍入规则并保留原值。负数、科学计数法和缺失 decimals 在此直接拒绝，避免它们被悄悄解释成另一种金额。</p>
+<h2 id="把异常做成可以重放的事件序列">把异常做成可以重放的事件序列</h2>
+<p>验证一个索引流程，可以先准备确定性的日志夹具：同一日志收到两次；同笔交易有两条日志；相同高度区块哈希改变；旧分支撤销后重新扫描；节点返回超时；地址正确但链不匹配；大整数金额超出安全整数范围。</p>
+<p>每组序列都检查最终派生状态，而不仅是处理函数是否返回成功。重放两次后事件集合应稳定，失效观察不能继续贡献业务结果，不同资产单位不能混算。测试网络再补节点分页、断线恢复和真实回执的集成演练，最后才讨论生产接入。</p>
+<p>本站 <a href="/zh/lab/chain/">ChainScope 案例</a>可以编辑合成输入，观察精度、重复事件和确认条件的处理。它帮助展示工程规则，不连接真实 RPC；本文的金额函数另做本地断言，钱包签名、合约账户验证和实际链重组未在此集成运行。</p>
+<h2 id="让界面说出系统真正知道的事">让界面说出系统真正知道的事</h2>
+<p>“已提交”比无法证实的“已成功”更有用，“等待核对”也比随意归类失败更准确。一个可维护的 Web3 应用，需要把身份、签名意图、执行结果和业务状态分别留下证据，再用明确的转换关系连接起来。用户不必看到所有技术字段，但应该知道当前处于哪一步，以及下一步由谁推进。</p>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2025/">2025 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/web3/"># Web3</a><a href="/zh/blog/tags/typescript/"># TypeScript</a><a href="/zh/blog/tags/backend/"># Backend</a><a href="/zh/blog/tags/reliability/"># Reliability</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#钱包弹窗关闭之后业务才刚开始" class="toc-level-2">钱包弹窗关闭之后，业务才刚开始</a><a href="#连接钱包与登录会话要分别失效" class="toc-level-2">连接钱包与登录会话要分别失效</a><a href="#为每次操作保留三个身份" class="toc-level-2">为每次操作保留三个身份</a><a href="#成功应该是一组可以解释的状态" class="toc-level-2">成功应该是一组可以解释的状态</a><a href="#链重组要求修正观察而不是再加一次余额" class="toc-level-2">链重组要求修正观察，而不是再加一次余额</a><a href="#金额的精度属于数据协议" class="toc-level-2">金额的精度属于数据协议</a><a href="#把异常做成可以重放的事件序列" class="toc-level-2">把异常做成可以重放的事件序列</a><a href="#让界面说出系统真正知道的事" class="toc-level-2">让界面说出系统真正知道的事</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="tracing-timeout-budget"><div class="post-meta"><span class="note-year">2022 · 技术回顾</span><span>6 分钟阅读</span></div><h3><a href="/zh/blog/tracing-timeout-budget/">跨服务调用为什么慢：trace、超时预算与错误关联</a></h3><p>从排队、并行调用和超时重置分析跨服务延迟，把链路上下文、剩余预算与错误分类分开设计，并用确定性模型验证截止时间不会被下游延长。</p><div class="post-bottom"><div class="tags"><span>API</span><span>OpenTelemetry</span><span>Backend</span><span>Reliability</span></div><a class="icon-link" href="/zh/blog/tracing-timeout-budget/" aria-label="阅读全文: 跨服务调用为什么慢：trace、超时预算与错误关联"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="redis-cache-recovery"><div class="post-meta"><span class="note-year">2020 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/redis-cache-recovery/">缓存失效后的高峰：Redis回源、过期抖动与故障降级</a></h3><p>分析热点失效时的回源放大、刷新租约过期与旧值覆盖，使用所有者令牌和原子发布限定刷新资格，并明确陈旧数据与数据库一致性的边界。</p><div class="post-bottom"><div class="tags"><span>Redis</span><span>Cache</span><span>Backend</span><span>Reliability</span></div><a class="icon-link" href="/zh/blog/redis-cache-recovery/" aria-label="阅读全文: 缓存失效后的高峰：Redis回源、过期抖动与故障降级"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>

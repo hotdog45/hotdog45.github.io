@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>订单一致性：PostgreSQL事务隔离与乐观并发控制 — Xiaofeng Qiao</title><meta name="description" content="用最后一件库存的并发预留解释事务不变量、条件更新、请求去重与版本比较，并给出可复现的双会话 SQL 实验和验证边界。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/postgres-transaction-invariants/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/postgres-transaction-invariants/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="订单一致性：PostgreSQL事务隔离与乐观并发控制 — Xiaofeng Qiao"><meta property="og:description" content="用最后一件库存的并发预留解释事务不变量、条件更新、请求去重与版本比较，并给出可复现的双会话 SQL 实验和验证边界。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2019 · 技术回顾</span><span>7 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">订单一致性：PostgreSQL事务隔离与乐观并发控制</h1><p class="article-deck" itemprop="description">用最后一件库存的并发预留解释事务不变量、条件更新、请求去重与版本比较，并给出可复现的双会话 SQL 实验和验证边界。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="最后一件库存不能只检查最后的数字">最后一件库存，不能只检查最后的数字</h2>
+<p>库存还有一件，两个请求都读到一，再各自创建一条预留记录，最后都把库存写成零。数据库没有出现负数，但两张有效预留已经占用了同一件商品。只检查 <code>available &gt;= 0</code>，甚至可能得到一个看起来“正确”的结果。</p>
+<p>讨论一致性时，我更愿意先写不变量：有效预留不能超过可分配库存；同一业务请求不能重复扣减；预留记录与库存变化必须一起成功或一起失败。库存数字、订单状态与重试结果要放在同一个推理范围，不能各自都说“已经加事务了”。以下用独立构造的单商品预留示例分析这些边界。</p>
+<p>本文以 2019 年 10 月发布的 PostgreSQL 12 文档为回顾基线。相关机制并非都在 12 首次出现；版本号用于固定讨论语义。12 目前已经停止支持，新部署应选仍受支持的版本，并重新运行实验，而不是为了复盘安装旧生产版本。<a href="https://www.postgresql.org/docs/12/release-12.html" rel="noopener noreferrer">PostgreSQL 12 发布记录</a></p>
+<h2 id="事务保证原子性不替你修正判断条件">事务保证原子性，不替你修正判断条件</h2>
+<p>下面的结构仍然有问题，即使外面包了 <code>BEGIN</code> 和 <code>COMMIT</code>：</p>
+<pre><code class="language-text">读取 available 得到 old
+如果 old &gt;= 1：
+    插入预留
+    将 available 写成 old - 1
+</code></pre>
+<p>应用把“过去读到的值”写回去，另一个事务的业务决策可能已经使用了同一份库存。解决这种单行扣减，通常不必先升级整个系统的隔离级别，而是把资格判断和修改合成一条语句：</p>
+<pre><code class="language-sql">UPDATE inventory
+SET available = available - 1, version = version + 1
+WHERE sku = 'demo-widget' AND available &gt;= 1
+RETURNING available, version;
+</code></pre>
+<p>返回一行才说明本次取得库存，返回零行应走拒绝或重新读取的分支。<code>UPDATE</code> 执行成功不等于业务条件成立；客户端若忽略受影响行数，仍可能创建没有库存支撑的订单。<a href="https://www.postgresql.org/docs/12/sql-update.html" rel="noopener noreferrer">UPDATE 与 RETURNING</a></p>
+<p>PostgreSQL 默认的 Read Committed 对每条普通查询建立快照。并发更新同一行时，后一个更新会等待；前一个提交后，更新条件会针对新的行版本重新判断。因此在这个特定例子里，第一个请求扣到零，第二个请求不能再通过 <code>available &gt;= 1</code>。这依赖明确的单行条件，不能直接外推到复杂跨行规则。<a href="https://www.postgresql.org/docs/12/transaction-iso.html" rel="noopener noreferrer">事务隔离说明</a></p>
+<h2 id="把重复请求也放入同一个事务">把重复请求也放入同一个事务</h2>
+<p>库存扣减安全以后，还要处理同一个请求重试。一个请求如果第一次已经成功，再次到来应返回既有预留，而不是因为库存归零被误判为新的失败。示例用 <code>request_id</code> 主键去重，数量与库存增加数据库约束：</p>
+<pre><code class="language-sql">CREATE SCHEMA blog_order_demo;
+CREATE TABLE blog_order_demo.inventory (
+  sku text PRIMARY KEY,
+  available integer NOT NULL CHECK (available &gt;= 0),
+  version integer NOT NULL DEFAULT 0
+);
+CREATE TABLE blog_order_demo.reservations (
+  request_id text PRIMARY KEY,
+  sku text NOT NULL REFERENCES blog_order_demo.inventory(sku),
+  quantity integer NOT NULL CHECK (quantity &gt; 0)
+);
+INSERT INTO blog_order_demo.inventory(sku, available)
+VALUES ('demo-widget', 1);
+</code></pre>
+<p>这里的约束是最后防线，不能替代业务检查。<code>CHECK (available &gt;= 0)</code> 只看一行数据，无法发现前面“库存是零、却有两张预留”的错误；主键也必须声明在真实的业务作用域内。多租户系统通常需要把租户与业务请求号一起纳入唯一键。<code>NOT NULL</code> 则避免可空键带来的语义缺口。<a href="https://www.postgresql.org/docs/12/ddl-constraints.html" rel="noopener noreferrer">约束与唯一性</a></p>
+<p>下面的函数展示完整的数据库内原子步骤。实际应用还应在调用之前完成鉴权、请求大小限制和业务字段校验：</p>
+<pre><code class="language-sql">CREATE FUNCTION blog_order_demo.reserve(
+  p_request text, p_sku text, p_quantity integer
+) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+  inserted integer;
+  previous blog_order_demo.reservations%ROWTYPE;
+BEGIN
+  IF p_request IS NULL OR p_request = ''
+     OR p_quantity IS NULL OR p_quantity &lt;= 0 THEN
+    RAISE EXCEPTION 'invalid reservation request';
+  END IF;
+  INSERT INTO blog_order_demo.reservations(request_id, sku, quantity)
+    VALUES (p_request, p_sku, p_quantity)
+    ON CONFLICT (request_id) DO NOTHING;
+  GET DIAGNOSTICS inserted = ROW_COUNT;
+  IF inserted = 0 THEN
+    SELECT * INTO STRICT previous FROM blog_order_demo.reservations
+      WHERE request_id = p_request;
+    IF previous.sku IS DISTINCT FROM p_sku
+       OR previous.quantity &lt;&gt; p_quantity THEN
+      RAISE EXCEPTION 'request_id reused with different input';
+    END IF;
+    RETURN 'replayed';
+  END IF;
+  UPDATE blog_order_demo.inventory
+    SET available = available - p_quantity, version = version + 1
+    WHERE sku = p_sku AND available &gt;= p_quantity;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'insufficient stock';
+  END IF;
+  RETURN 'created';
+END;
+$$;
+</code></pre>
+<p>函数先争取业务请求号，再扣库存。请求已存在时比较参数，不能把“同键异参”默默吞掉。库存不足则抛出错误，由事务回滚本次插入的预留。这里不能在异常后仍然提交其他业务步骤，也不应该把所有唯一冲突都当作成功；冲突可能来自不同约束。<a href="https://www.postgresql.org/docs/12/sql-insert.html" rel="noopener noreferrer">INSERT 与 ON CONFLICT</a></p>
+<h2 id="版本号适合不能覆盖别人修改的编辑">版本号适合“不能覆盖别人修改”的编辑</h2>
+<p>下单扣减表达的是“只要现在足够就扣一件”；后台编辑表达的可能是“只有我看到的那个版本没有变，才把库存设为五”。这两种意图不一样。后者可以用显式版本比较：</p>
+<pre><code class="language-sql">UPDATE blog_order_demo.inventory
+SET available = 5, version = version + 1
+WHERE sku = 'demo-widget' AND version = 0
+RETURNING version;
+</code></pre>
+<p>零行意味着版本已经变化，界面应读回最新值，让操作者合并或重新确认。不断用同一个旧版本自动重试没有意义；把旧页面的绝对值覆盖成最新值，更是绕过了比较。还要保证所有相关写入路径都会递增版本，否则遗漏的后台脚本会破坏这份约定。</p>
+<p>显式锁是另一个选项。需要先读一行再做若干判断时，<code>SELECT ... FOR UPDATE</code> 可以在事务内保护这行直到结束，但它会使竞争者等待；锁内调用慢速外部 API 会把网络延迟变成数据库排队。多行更新应统一锁顺序，缩短锁持有时间，而不是把长业务流程整个装进一个大事务。<a href="https://www.postgresql.org/docs/12/explicit-locking.html" rel="noopener noreferrer">行锁与死锁</a></p>
+<h2 id="隔离级别升级后重试边界也要升级">隔离级别升级后，重试边界也要升级</h2>
+<p>跨行规则，例如某个集合的总预留不能超出额度，未必能由一条行级谓词表达。可以重新设计数据，把额度集中到可原子更新的记录；也可以评估显式锁或 Serializable。选择应来自不变量和竞争模式，而不是把更高隔离级别当成不需要理解并发的开关。</p>
+<p>遇到数据库的序列化失败，需要回滚并重新执行整个事务，包括产生决策的读取；只重跑最后一条 SQL 可能沿用已经失效的判断。重试也要有次数和截止时间，事务外的通知必须避免重复。<a href="https://www.postgresql.org/docs/12/transaction-iso.html" rel="noopener noreferrer">序列化与重试边界</a> 应用最好按 SQLSTATE 识别错误，区分 <code>40001</code> 序列化失败、<code>40P01</code> 死锁与业务拒绝，而不是匹配会随语言变化的错误文本。<a href="https://www.postgresql.org/docs/12/errcodes-appendix.html" rel="noopener noreferrer">PostgreSQL 错误码</a></p>
+<h2 id="用两个会话验证等待与回滚">用两个会话验证等待与回滚</h2>
+<p>在一次性测试数据库执行建表与函数脚本后，按下面的顺序运行。不要在生产库创建此教学 schema。</p>
+<pre><code class="language-sql">-- 会话 A：先执行，但暂不提交
+BEGIN;
+SELECT blog_order_demo.reserve('request-a', 'demo-widget', 1);
+-- 预期 created
+
+-- 会话 B：A 未提交时执行；预期等待 A
+BEGIN;
+SELECT blog_order_demo.reserve('request-b', 'demo-widget', 1);
+
+-- 回到 A
+COMMIT;
+
+-- B 预期得到 insufficient stock；随后执行
+ROLLBACK;
+</code></pre>
+<p>最后查询应只有一张预留，库存零、版本一；再次使用 <code>request-a</code> 应得到 <code>replayed</code> 且不再扣库存。再做三组变体：A 回滚而非提交，两个会话使用相同请求号，以及相同请求号换数量。检查最终表数据，并记录哪个会话等待、哪个事务回滚，才能把接口结果和数据库状态对上。</p>
+<p>上述 SQL 与双会话实验尚未连接 PostgreSQL 实际执行。随稿 <code>examples/inventory_state_model.py</code> 的六项纯状态模型测试已在 Python 3.9.6 通过，覆盖两种串行顺序、重复请求、异参冲突、失败回滚、旧版本拒绝，以及一个“库存不负但超卖”的反例。它验证业务推理，不模拟 PostgreSQL 的 MVCC、锁等待或 SQL 语法；不能用它替代目标数据库集成测试。</p>
+<h2 id="结论">结论</h2>
+<p>订单一致性要从跨记录的不变量出发，再选择数据库能原子执行的条件。单行条件扣减、请求唯一约束和事务解决这一例子的核心问题；版本号保护的是另一种“基于旧视图编辑”的意图。隔离级别、锁和重试必须共同设计，最终用并发会话及提交后的数据证明结果，而不是仅凭“使用了事务”作保证。</p>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2019/">2019 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/postgresql/"># PostgreSQL</a><a href="/zh/blog/tags/sql/"># SQL</a><a href="/zh/blog/tags/backend/"># Backend</a><a href="/zh/blog/tags/concurrency/"># Concurrency</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#最后一件库存不能只检查最后的数字" class="toc-level-2">最后一件库存，不能只检查最后的数字</a><a href="#事务保证原子性不替你修正判断条件" class="toc-level-2">事务保证原子性，不替你修正判断条件</a><a href="#把重复请求也放入同一个事务" class="toc-level-2">把重复请求也放入同一个事务</a><a href="#版本号适合不能覆盖别人修改的编辑" class="toc-level-2">版本号适合“不能覆盖别人修改”的编辑</a><a href="#隔离级别升级后重试边界也要升级" class="toc-level-2">隔离级别升级后，重试边界也要升级</a><a href="#用两个会话验证等待与回滚" class="toc-level-2">用两个会话验证等待与回滚</a><a href="#结论" class="toc-level-2">结论</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="go-cancellation-lifecycle"><div class="post-meta"><span class="note-year">2020 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/go-cancellation-lifecycle/">Go服务如何停止：context取消、goroutine退出与资源归还</a></h3><p>以一个有界并发处理器为例，拆开取消通知、阻塞点退出和完成等待，建立可以验证的资源生命周期。</p><div class="post-bottom"><div class="tags"><span>Go</span><span>Concurrency</span><span>Backend</span><span>Testing</span></div><a class="icon-link" href="/zh/blog/go-cancellation-lifecycle/" aria-label="阅读全文: Go服务如何停止：context取消、goroutine退出与资源归还"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="java-future-pools"><div class="post-meta"><span class="note-year">2017 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/java-future-pools/">Java异步任务：CompletableFuture、线程池与超时传播</a></h3><p>从一个有界线程池出发，说明异步组合、队列饱和、等待超时和底层工作取消为什么是四个不同问题。</p><div class="post-bottom"><div class="tags"><span>Java</span><span>Concurrency</span><span>Backend</span><span>Testing</span></div><a class="icon-link" href="/zh/blog/java-future-pools/" aria-label="阅读全文: Java异步任务：CompletableFuture、线程池与超时传播"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>

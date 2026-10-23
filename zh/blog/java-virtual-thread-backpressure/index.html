@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Java虚拟线程：I/O并发增加后，数据库连接池怎么办 — Xiaofeng Qiao</title><meta name="description" content="把虚拟线程的调度能力与下游容量分开，使用有期限的许可控制、入口限流和可验证的资源归还保护服务。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/java-virtual-thread-backpressure/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/java-virtual-thread-backpressure/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="Java虚拟线程：I/O并发增加后，数据库连接池怎么办 — Xiaofeng Qiao"><meta property="og:description" content="把虚拟线程的调度能力与下游容量分开，使用有期限的许可控制、入口限流和可验证的资源归还保护服务。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2023 · 技术回顾</span><span>6 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">Java虚拟线程：I/O并发增加后，数据库连接池怎么办</h1><p class="article-deck" itemprop="description">把虚拟线程的调度能力与下游容量分开，使用有期限的许可控制、入口限流和可验证的资源归还保护服务。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="线程变便宜连接却没有变多">线程变便宜，连接却没有变多</h2>
+<p>把请求处理改成虚拟线程后，原来受线程数限制的代码可能同时发起更多数据库调用。应用侧看起来不再缺线程，数据库连接池却开始排队，用户等待反而变长。</p>
+<p>这并不矛盾。虚拟线程改变了等待任务占用执行线程的成本，没有替数据库增加连接、CPU或事务吞吐。本文回顾Java21在2023年正式提供的能力，重点讨论下游资源背压。以下分析按Java21语义展开；后续JDK优化需要按对应版本重新评估。</p>
+<p>Oracle的Java21说明强调虚拟线程主要面向大量等待I/O的任务，不是让单次计算本身更快。<a href="https://docs.oracle.com/en/java/javase/21/core/virtual-threads.html" rel="noopener noreferrer">Java21 Virtual Threads</a></p>
+<h2 id="不再用线程池间接代表数据库容量">不再用线程池间接代表数据库容量</h2>
+<p>传统线程池常同时承担两种角色：复用昂贵线程，以及限制同时执行的任务。迁移到虚拟线程时，如果照搬一个“小型虚拟线程池”，会把两件事继续绑在一起。</p>
+<p>更清楚的设计是：执行器按任务提供虚拟线程，而数据库调用、第三方接口和CPU重任务各自有容量边界。一个请求可能不访问数据库，另一个请求可能持有连接更久，它们不该因为线程模型相同，就被当成同一种资源消耗。</p>
+<p>同样，不应把数据库连接保存在每个线程的ThreadLocal中，假定线程数量始终很少。数量增长后，原来的隐式缓存可能变成大量资源持有。连接应由连接池管理，在明确的作用域内获取并归还。</p>
+<h2 id="用许可表达最多同时占用多少依赖">用许可表达“最多同时占用多少依赖”</h2>
+<p>配套PermitGate把依赖容量表示为Semaphore，而不是虚拟线程的数量：</p>
+<pre><code class="language-java">public &lt;T&gt; T call(long waitMillis, Callable&lt;T&gt; work) throws Exception {
+    if (!permits.tryAcquire(waitMillis, TimeUnit.MILLISECONDS)) {
+        throw new RejectedExecutionException(&quot;capacity exhausted&quot;);
+    }
+    try { return work.call(); }
+    finally { permits.release(); }
+}
+</code></pre>
+<p>只有实际拿到许可才进入finally归还，避免未取得资源时误释放。等待许可有上限，错误也保留为容量不足，而不是伪装成正常空结果。示例开启公平队列只是便于表达顺序意图，不构成跨请求、跨租户的完整公平调度保证。</p>
+<p>Java21调用侧可以使用每任务虚拟线程执行器：</p>
+<pre><code class="language-java">PermitGate database = new PermitGate(2);
+try (ExecutorService tasks = Executors.newVirtualThreadPerTaskExecutor()) {
+    Future&lt;String&gt; result = tasks.submit(
+        () -&gt; database.call(100, () -&gt; &quot;fixture-row&quot;)
+    );
+    System.out.println(result.get());
+}
+</code></pre>
+<p>这里的2和100毫秒是离线示意参数，没有经过生产容量测量；返回值也是固定夹具，不是数据库查询。真正的许可数量应与连接池、查询类型和下游预算共同设计，不能把示例数字直接当成最佳实践。</p>
+<h2 id="容量门之外还需要入口边界">容量门之外，还需要入口边界</h2>
+<p>Semaphore限制了正在使用依赖的任务，却可能留下大量等待许可的任务。若接口无限接收请求，仍会积累请求体、future、日志上下文和超时状态。线程便宜不代表这些对象没有成本。</p>
+<p>因此需要同时考虑入口最大在途请求、队列长度、请求大小和等待期限。过载时及时拒绝，通常比让所有人等待到超时更可控。拒绝后若上游立即重试，又可能放大负载；客户端退避与服务端容量信号应该共同设计。</p>
+<p>多个资源也不能随意嵌套占用。先拿数据库许可，再长时间等待远端API，会把两个依赖的容量绑成一个系统性瓶颈。可以缩小持有区间，先完成不需要连接的工作，再开启尽可能短的事务；必要时采用异步状态流程，而不是持着事务等待人工或网络。</p>
+<h2 id="超时预算要覆盖排队和实际操作">超时预算要覆盖排队和实际操作</h2>
+<p>许可等待、连接获取、SQL执行和结果读取，共用一次请求的剩余预算。如果每个阶段都重新获得完整超时，最终请求可能明显超过调用方容许时间。</p>
+<p>而且等待者超时不代表底层语句已经停止。应结合驱动的取消与语句超时能力，并验证连接能否安全复用。对于结果未知的写操作，需要业务操作标识和状态查询，不能凭一个TimeoutException直接再次写入。</p>
+<p>这也是为什么迁移验收不能只比较请求总数。应分别测量许可等待、连接等待、查询执行、错误率和资源归还情况，才能判断瓶颈是真的消失，还是换了位置。</p>
+<h2 id="java21的pinning要按版本和调用链定位">Java21的pinning要按版本和调用链定位</h2>
+<p>在Java21中，一些阻塞场景会让虚拟线程不能从carrier上卸载，例如相关的synchronized或native调用路径。它影响可扩展性，不意味着所有使用synchronized的代码都必须机械替换。</p>
+<p>应先观察实际长时间阻塞在哪里，再缩小锁范围或采用适当的锁机制。Java21提供的JFR虚拟线程事件可用于定位；这些约束不能不加版本说明地推广为所有未来JDK的固定结论。迁移时还应核对数据库驱动、监控和诊断工具的对应版本，而不只替换执行器一行代码。</p>
+<h2 id="本机验证了许可模型没有运行java21">本机验证了许可模型，没有运行Java21</h2>
+<p>本机可用的是JDK8与JDK11，未安装新工具链。配套把PermitGate和平台线程测试以Java8兼容目标在Corretto11.0.23编译执行，验证了两个许可占满时第三次调用被拒绝、成功后归还许可、异常后不泄漏，以及恢复后仍可继续调用。</p>
+<pre><code class="language-bash">javac --release 8 PermitGate.java PermitGateTest.java
+java PermitGateTest
+</code></pre>
+<p>测试使用闩锁确定占用状态，没有靠睡眠猜测并发时序。独立的VirtualGate.java按Java21官方API审阅，但未在本机编译或运行。上述通过结果只证明共享的容量控制逻辑，不能称为虚拟线程性能、pinning或驱动兼容性验证。</p>
+<p>具备Java21环境后，还需要运行虚拟线程分支、接入受控数据库做负载和取消测试，并比较迁移前后的同一组业务指标。没有这些结果，不应把“支持更多任务”写成虚构的吞吐提升比例。</p>
+<h2 id="调度机制与业务容量要分别治理">调度机制与业务容量要分别治理</h2>
+<p>虚拟线程让同步风格的I/O代码有了新的扩展空间。可靠迁移的重点，是把过去由线程数隐含控制的资源约束显式化：入口限制、依赖许可、请求期限和资源归还分别可见。这样才能利用新的调度能力，而不把压力直接传给下游。</p>
+<h2 id="参考与配套">参考与配套</h2>
+<ul>
+<li><a href="https://docs.oracle.com/en/java/javase/21/core/virtual-threads.html" rel="noopener noreferrer">Oracle Java21 Virtual Threads</a>：执行器、适用场景、Java21 pinning与采用建议。</li>
+<li><code>examples/java-capacity/</code>包含可运行的许可测试和明确标为未运行的Java21示例。</li>
+<li>实际工具链、通过结果及未验证范围记录在<code>quality.json</code>。</li>
+</ul>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2023/">2023 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/java/"># Java</a><a href="/zh/blog/tags/concurrency/"># Concurrency</a><a href="/zh/blog/tags/architecture/"># Architecture</a><a href="/zh/blog/tags/testing/"># Testing</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#线程变便宜连接却没有变多" class="toc-level-2">线程变便宜，连接却没有变多</a><a href="#不再用线程池间接代表数据库容量" class="toc-level-2">不再用线程池间接代表数据库容量</a><a href="#用许可表达最多同时占用多少依赖" class="toc-level-2">用许可表达“最多同时占用多少依赖”</a><a href="#容量门之外还需要入口边界" class="toc-level-2">容量门之外，还需要入口边界</a><a href="#超时预算要覆盖排队和实际操作" class="toc-level-2">超时预算要覆盖排队和实际操作</a><a href="#java21的pinning要按版本和调用链定位" class="toc-level-2">Java21的pinning要按版本和调用链定位</a><a href="#本机验证了许可模型没有运行java21" class="toc-level-2">本机验证了许可模型，没有运行Java21</a><a href="#调度机制与业务容量要分别治理" class="toc-level-2">调度机制与业务容量要分别治理</a><a href="#参考与配套" class="toc-level-2">参考与配套</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="java-future-pools"><div class="post-meta"><span class="note-year">2017 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/java-future-pools/">Java异步任务：CompletableFuture、线程池与超时传播</a></h3><p>从一个有界线程池出发，说明异步组合、队列饱和、等待超时和底层工作取消为什么是四个不同问题。</p><div class="post-bottom"><div class="tags"><span>Java</span><span>Concurrency</span><span>Backend</span><span>Testing</span></div><a class="icon-link" href="/zh/blog/java-future-pools/" aria-label="阅读全文: Java异步任务：CompletableFuture、线程池与超时传播"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="rn-new-architecture-migration"><div class="post-meta"><span class="note-year">2024 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/rn-new-architecture-migration/">React Native新架构迁移：兼容层、原生模块与回归矩阵</a></h3><p>以RN0.76为历史锚点，拆开运行时升级、原生依赖迁移和业务验收，用显式证据门槛避免把能编译误当成迁移完成。</p><div class="post-bottom"><div class="tags"><span>React-Native</span><span>Architecture</span><span>Testing</span><span>Native-Modules</span></div><a class="icon-link" href="/zh/blog/rn-new-architecture-migration/" aria-label="阅读全文: React Native新架构迁移：兼容层、原生模块与回归矩阵"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>

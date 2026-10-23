@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Android页面重建：业务状态、界面状态与恢复顺序 — Xiaofeng Qiao</title><meta name="description" content="从搜索列表的旋转与进程重建出发，区分可保存的小型界面状态、可重算数据和必须持久化的业务事实。">
+<meta name="theme-color" content="#f6f5ef"><meta name="color-scheme" content="light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://hotdog45.github.io/zh/blog/android-state-recovery/"><meta property="og:url" content="https://hotdog45.github.io/zh/blog/android-state-recovery/">
+
+<meta property="og:type" content="article"><meta property="og:title" content="Android页面重建：业务状态、界面状态与恢复顺序 — Xiaofeng Qiao"><meta property="og:description" content="从搜索列表的旋转与进程重建出发，区分可保存的小型界面状态、可重算数据和必须持久化的业务事实。"><meta property="og:site_name" content="Xiaofeng Qiao">
+<meta property="og:image" content="https://hotdog45.github.io/assets/xq-avatar.png">
+<meta name="twitter:card" content="summary"><link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Xiaofeng Qiao · 技术博客" href="/zh/feed.xml">
+<link rel="stylesheet" href="/assets/styles.css"><link rel="stylesheet" href="/assets/portfolio.css"><link rel="stylesheet" href="/assets/scenes.css"><link rel="stylesheet" href="/assets/product-lab.css"><script type="module" src="/assets/app.js"></script>
+</head><body data-lang="zh">
+<a class="skip-link" href="#main">跳至主要内容</a>
+
+<header class="site-header"><div class="container header-inner">
+<a class="brand" href="/zh/" aria-label="Xiaofeng Qiao · 返回首页"><span class="brand-mark">xq<span>•</span></span><span>Xiaofeng Qiao<span class="brand-sub">ENGINEER & ARCHITECT</span></span></a>
+<button class="menu-toggle" aria-label="菜单" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button>
+<nav id="site-nav" aria-label="主导航">
+<a  href="/zh/projects/">项目与方案</a><a  href="/zh/#services">服务方向</a><a  href="/zh/#about">关于我</a><a aria-current="page" href="/zh/blog/">技术博客</a>
+<a href="/zh/lab/" >产品实验室</a>
+<a class="language-switch" href="/en/" hreflang="en" lang="en">EN</a>
+<a class="nav-contact" href="/zh/#contact">聊聊需求 <span aria-hidden="true">↗</span></a></nav>
+</div></header>
+<main id="main"><div class="container article-layout"><article class="article" itemscope itemtype="https://schema.org/BlogPosting"><a class="back-link" href="/zh/blog/">← 返回文章列表</a><div class="post-meta"><span class="note-year">2015 · 技术回顾</span><span>8 分钟阅读</span></div><meta itemprop="dateCreated" content="2026-10-23"><h1 itemprop="headline">Android页面重建：业务状态、界面状态与恢复顺序</h1><p class="article-deck" itemprop="description">从搜索列表的旋转与进程重建出发，区分可保存的小型界面状态、可重算数据和必须持久化的业务事实。</p><div class="article-author"><span class="small-monogram">xq.</span><span itemprop="author" itemscope itemtype="https://schema.org/Person"><span itemprop="name">Xiaofeng Qiao</span></span><span class="article-published">发布于 <time datetime="2026-10-23" itemprop="datePublished">2026年10月23日</time></span><span class="small-muted">本文暂时仅提供中文版本。</span></div><div class="prose" itemprop="articleBody"><h2 id="用户回来时究竟希望恢复什么">用户回来时，究竟希望恢复什么</h2>
+<p>一个搜索列表在旋转后回到顶部，通常不会被归类成崩溃，却足以让人怀疑刚才的操作是否成功。搜索词、筛选条件、正在阅读的位置和服务器返回的商品列表，看起来都属于“页面状态”，实际需要不同的保存方式。把它们一起塞进一个对象，页面重新创建时便很难判断哪些应该恢复，哪些应该重新加载。</p>
+<p>本文在2026年回顾2015年前后以Activity、View和Bundle为主的实现方式，使用虚构搜索列表分析恢复契约。现代Android文档还讨论ViewModel、SavedStateHandle和Compose；这些是今天选择方案时的参考，不能回写成2015年的实现。验证程序采用Java 8语言基线，不依赖Android运行时。</p>
+<p>先定义用户意图：系统重建同一个搜索页面时保留查询和阅读锚点；新的明确搜索入口应覆盖旧查询；用户结束页面后重新打开，不应自动复活一次已经结束的临时交互。Android官方文档区分了配置变化、系统进程回收与用户主动结束页面，也区分了内存状态、保存状态和持久化数据的寿命。<a href="https://developer.android.com/topic/libraries/architecture/saving-states" rel="noopener noreferrer">状态保存指南</a></p>
+<h2 id="小型快照不是业务数据库">小型快照不是业务数据库</h2>
+<p>保存快照可以包含查询字符串、已选筛选ID、列表锚点ID和相对偏移。商品全集、位图、网络请求对象和Activity引用不适合放进去：它们要么体积较大，要么无法跨进程恢复，要么只是执行过程中的对象。重新加载列表时，服务器结果才是商品是否仍存在、是否有库存的依据。</p>
+<p>购物草稿、用户主动编辑的长文本和待发送业务记录则是另一类问题。若用户退出应用仍期望它们存在，应该设计持久化保存、版本迁移和失败处理，不能依赖某次生命周期回调恰好被调用。把“UI暂存成功”当作“业务已提交”，会让恢复出来的界面看起来完整，服务端却没有相应记录。</p>
+<p>对每个字段，可以问一个很具体的问题：丢失后是重新计算、重新请求，还是会丢掉用户无法重现的输入？前两类通常只存恢复所需的小标识；最后一类需要更可靠的持久化策略。恢复快照最好也有自己的schema，方便旧版本残留数据遇到新代码时采取可解释的降级。</p>
+<h2 id="恢复有顺序不能只在最后调用一次settext">恢复有顺序，不能只在最后调用一次setText</h2>
+<p>搜索词应该在发起加载之前恢复，否则页面可能先发出默认查询，之后才把输入框改成旧查询。界面与结果因此属于两套条件。列表位置也不能在数据尚未到达时恢复：以前的第八行，未必还是本次结果的第八行。更稳妥的做法是保存稳定条目ID，等对应查询的数据到达后再寻找锚点；条目已删除时使用明确的回退位置。</p>
+<p>另外，新的外部入口需要自己的优先级。例如用户从快捷入口明确搜索“laptop”，旧快照里的“camera”不应抢回控制权。空字符串也可能是用户明确要求清空查询，不能和“没有提供新查询”混为一谈。</p>
+<p>下面的完整程序用字符串Map模拟小型保存容器，便于在桌面环境验证决策。接入Activity时，应把这些少量字段映射到Bundle，并按实际页面生命周期调用；Map测试不等于已经验证Bundle序列化、View自动保存或设备进程重建。</p>
+<pre><code class="language-java">import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public final class AndroidStateRecovery {
+    static final class SearchState {
+        final String query;
+        final String anchorId;
+        final int offset;
+
+        SearchState(String query, String anchorId, int offset) {
+            this.query = query;
+            this.anchorId = anchorId;
+            this.offset = offset;
+        }
+
+        Map&lt;String, String&gt; save() {
+            Map&lt;String, String&gt; snapshot = new HashMap&lt;&gt;();
+            snapshot.put(&quot;schema&quot;, &quot;1&quot;);
+            snapshot.put(&quot;query&quot;, query);
+            snapshot.put(&quot;anchor&quot;, anchorId);
+            snapshot.put(&quot;offset&quot;, Integer.toString(offset));
+            return snapshot;
+        }
+
+        static SearchState restore(Map&lt;String, String&gt; snapshot, String newRouteQuery) {
+            if (newRouteQuery != null) return fresh(newRouteQuery);
+            if (snapshot == null || !&quot;1&quot;.equals(snapshot.get(&quot;schema&quot;))) return fresh(&quot;&quot;);
+            String query = snapshot.get(&quot;query&quot;);
+            String anchor = snapshot.get(&quot;anchor&quot;);
+            if (query == null || query.length() &gt; 200 || anchor == null) return fresh(&quot;&quot;);
+            try {
+                int offset = Integer.parseInt(snapshot.get(&quot;offset&quot;));
+                if (offset &lt; 0 || offset &gt; 10000) return fresh(&quot;&quot;);
+                return new SearchState(query, anchor, offset);
+            } catch (NumberFormatException invalid) {
+                return fresh(&quot;&quot;);
+            }
+        }
+
+        static SearchState fresh(String query) { return new SearchState(query, &quot;&quot;, 0); }
+
+        int anchorIndexAfterLoad(List&lt;String&gt; itemIds) {
+            int index = itemIds.indexOf(anchorId);
+            return index &lt; 0 ? 0 : index;
+        }
+    }
+
+    static void check(boolean condition, String label) {
+        if (!condition) throw new AssertionError(label);
+    }
+
+    public static void main(String[] args) {
+        SearchState original = new SearchState(&quot;camera&quot;, &quot;item-9&quot;, 120);
+        Map&lt;String, String&gt; snapshot = original.save();
+        SearchState restored = SearchState.restore(snapshot, null);
+        check(restored.query.equals(&quot;camera&quot;), &quot;query restored before reload&quot;);
+        check(restored.offset == 120, &quot;small viewport offset retained&quot;);
+        check(restored.anchorIndexAfterLoad(Arrays.asList(&quot;item-8&quot;, &quot;item-9&quot;)) == 1,
+                &quot;anchor located after data arrives&quot;);
+        check(restored.anchorIndexAfterLoad(Arrays.asList(&quot;item-8&quot;)) == 0,
+                &quot;removed anchor falls back&quot;);
+        SearchState redirected = SearchState.restore(snapshot, &quot;laptop&quot;);
+        check(redirected.query.equals(&quot;laptop&quot;) &amp;&amp; redirected.anchorId.isEmpty(),
+                &quot;explicit new route overrides prior snapshot&quot;);
+        check(SearchState.restore(snapshot, &quot;&quot;).query.isEmpty(), &quot;explicit clear is not missing&quot;);
+        Map&lt;String, String&gt; unknown = new HashMap&lt;&gt;(snapshot);
+        unknown.put(&quot;schema&quot;, &quot;2&quot;);
+        check(SearchState.restore(unknown, null).query.isEmpty(), &quot;unknown snapshot rejected&quot;);
+        Map&lt;String, String&gt; corrupt = new HashMap&lt;&gt;(snapshot);
+        corrupt.put(&quot;offset&quot;, &quot;not-a-number&quot;);
+        check(SearchState.restore(corrupt, null).offset == 0, &quot;corrupt offset handled&quot;);
+        check(SearchState.restore(null, null).query.isEmpty(), &quot;fresh start independent of snapshot&quot;);
+        check(!snapshot.containsKey(&quot;items&quot;) &amp;&amp; !snapshot.containsKey(&quot;loading&quot;),
+                &quot;derived state excluded&quot;);
+        System.out.println(&quot;PASS: 10 state-recovery contract assertions; no Android runtime&quot;);
+    }
+}
+</code></pre>
+<p>这里没有保存 <code>loading</code>，因为重建前的请求对象已经不能作为当前请求状态的依据。恢复查询后重新进入加载状态，比恢复一个永远等不到旧回调的“加载中”更可控。错误提示也要区分：旧网络失败可以保留为诊断历史，但新页面是否继续显示它，应由当前恢复流程决定。</p>
+<h2 id="activity和view各自承担什么">Activity和View各自承担什么</h2>
+<p>使用传统View体系时，具有稳定ID的View可能参与框架自动状态保存；应用仍需要正确调用父类的状态保存逻辑，并处理自己额外拥有的字段。恢复代码还要避免和框架的自动恢复互相覆盖。不能一边让View恢复旧输入，一边又在稍后的通用初始化里把它重置成默认值。<a href="https://developer.android.com/guide/components/activities/activity-lifecycle" rel="noopener noreferrer">Activity生命周期说明</a></p>
+<p>一个可审查的接入顺序是：建立页面依赖，决定本次入口与快照的优先级，构造恢复后的查询状态，渲染输入，再加载数据，最后按稳定ID恢复锚点。UI事件绑定也需要避免把程序恢复动作当成一次新的用户输入，导致重复请求或重新清空锚点。</p>
+<p>这条顺序还需要一次“恢复完成”的明确边界。例如列表先收到缓存、再收到网络结果，不能每批数据到达都强行滚回旧锚点，否则用户已经开始新的滚动，页面又突然跳走。可以把锚点恢复作为本次重建的一次性效果；用户发生新的主动滚动后，就放弃尚未执行的旧锚点。代码模型只负责找到位置，实际接入时要把这项效果与用户事件的优先级一起验证。</p>
+<p>将所有状态放进静态变量，看起来能躲过旋转，但进程结束后同样丢失，还可能把某个Activity或大对象留在内存里。强行忽略配置变化也只是改变重建路径，不等于已经解决语言、字体、窗口大小等配置更新。现代ViewModel可以简化部分内存生命周期管理，但它本身不是跨系统进程回收的持久化方案。</p>
+<h2 id="测试恢复而不只是测试旋转">测试恢复，而不只是测试旋转</h2>
+<p>本例编译为Java 8兼容字节码，在Corretto 11.0.23运行，十组断言通过：查询、偏移、数据到达后的锚点、锚点删除、新入口覆盖、明确清空、未知schema、损坏字段、全新启动，以及派生数据不进入快照。</p>
+<pre><code class="language-bash">javac --release 8 -d classes AndroidStateRecovery.java
+java -cp classes AndroidStateRecovery
+</code></pre>
+<p>真实Android验证还需要区分不同动作。旋转主要覆盖Activity重建；“不保留活动”不能完整代表进程死亡；强制停止又带有用户主动结束的语义。应分别记录配置重建、应用在后台被系统回收后返回、用户主动退出再进入，以及新深链覆盖旧页面的结果。验证时还要包含数据已变化、离线和草稿保存失败，而不是只看同一列表能否滚回原处。</p>
+<p>恢复测试也应检查请求次数和副作用次数。界面文本正确，却重复订阅同一个数据源、重新发送一次业务提交，仍然属于恢复错误。加载查询可以根据缓存策略重复进行，提交订单则需要独立的幂等与状态核对，不能仅凭恢复后按钮仍显示“处理中”就再次执行。</p>
+<p>好的状态恢复不是把旧屏幕逐像素复活，而是把用户意图和当前真实数据重新对齐。先划分字段的寿命，再决定恢复优先级与加载顺序，通常比不断增加生命周期回调里的补丁更容易维护。</p>
+</div><div class="article-resources"><a href="/assets/downloads/engineering-notes-examples.zip" download>配套示例代码包 <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a><a href="/zh/blog/years/2015/">2015 · 同年主题</a></div><div class="article-tags"><a href="/zh/blog/tags/android/"># Android</a><a href="/zh/blog/tags/java/"># Java</a><a href="/zh/blog/tags/state/"># State</a><a href="/zh/blog/tags/testing/"># Testing</a></div><a class="back-link" href="/zh/blog/">← 返回文章列表</a></article><aside class="article-toc"><p class="eyebrow">本文目录</p><nav aria-label="本文目录"><a href="#用户回来时究竟希望恢复什么" class="toc-level-2">用户回来时，究竟希望恢复什么</a><a href="#小型快照不是业务数据库" class="toc-level-2">小型快照不是业务数据库</a><a href="#恢复有顺序不能只在最后调用一次settext" class="toc-level-2">恢复有顺序，不能只在最后调用一次setText</a><a href="#activity和view各自承担什么" class="toc-level-2">Activity和View各自承担什么</a><a href="#测试恢复而不只是测试旋转" class="toc-level-2">测试恢复，而不只是测试旋转</a></nav></aside></div><section class="container related-posts"><p class="eyebrow">继续阅读</p><div class="posts-grid"><article class="post-card" data-post-slug="java-future-pools"><div class="post-meta"><span class="note-year">2017 · 技术回顾</span><span>7 分钟阅读</span></div><h3><a href="/zh/blog/java-future-pools/">Java异步任务：CompletableFuture、线程池与超时传播</a></h3><p>从一个有界线程池出发，说明异步组合、队列饱和、等待超时和底层工作取消为什么是四个不同问题。</p><div class="post-bottom"><div class="tags"><span>Java</span><span>Concurrency</span><span>Backend</span><span>Testing</span></div><a class="icon-link" href="/zh/blog/java-future-pools/" aria-label="阅读全文: Java异步任务：CompletableFuture、线程池与超时传播"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article><article class="post-card" data-post-slug="java-virtual-thread-backpressure"><div class="post-meta"><span class="note-year">2023 · 技术回顾</span><span>6 分钟阅读</span></div><h3><a href="/zh/blog/java-virtual-thread-backpressure/">Java虚拟线程：I/O并发增加后，数据库连接池怎么办</a></h3><p>把虚拟线程的调度能力与下游容量分开，使用有期限的许可控制、入口限流和可验证的资源归还保护服务。</p><div class="post-bottom"><div class="tags"><span>Java</span><span>Concurrency</span><span>Architecture</span><span>Testing</span></div><a class="icon-link" href="/zh/blog/java-virtual-thread-backpressure/" aria-label="阅读全文: Java虚拟线程：I/O并发增加后，数据库连接池怎么办"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></a></div></article></div></section></main>
+<footer class="container site-footer"><a class="footer-brand" href="/zh/">xq<span>•</span></a><p>© 2026 Xiaofeng Qiao <span class="footer-tagline">· 认真构建，让软件有用。</span></p><div><a href="https://github.com/hotdog45" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a><a href="/zh/feed.xml">RSS</a><a href="/zh/privacy/">隐私说明</a></div></footer>
+</body></html>
